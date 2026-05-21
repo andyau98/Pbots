@@ -36,6 +36,7 @@ npm start
 | `#判頭列表`                                         | 列出已登記判頭               |
 | `#移除判頭 [ID]`                                    | 移除判頭                     |
 | `#圖紙 [編號]`                                      | 搜尋物料圖紙 (POR)           |
+| `#dwgfind` / `#找位置圖`                            | 輸入加工圖號 → 找對應位置圖  |
 | `#searchpor`                                        | 手動重建圖紙索引             |
 | `!addgroup` / `!removegroup`                        | 管理授權群組                 |
 | `!security` / `!cleanup` / `!mediastats`            | 系統管理                     |
@@ -53,6 +54,13 @@ npm start
 
 - 預建索引策略，支援物料碼前綴分類（FST=鐵料、FAC=鋁板…）
 - 模糊匹配，凌晨 3:00 AM 自動重建索引
+
+### 📐 DWG 加工圖 → 位置圖查詢（`#dwgfind`）
+
+- 使用 libredwg 從 DWG 直接提取文字（**100% 準確，不需 OCR**）
+- 輸入加工圖號 → 自動找出對應位置圖，可一併發送檔案
+- 從 Excel 提料單 + DWG 內容雙重建立 ACD→TG 對照表
+- 原有 PDF OCR 邏輯保留作為 fallback
 
 ### 📸 照片 → PDF
 
@@ -74,7 +82,7 @@ src/
 ├── core/                 # 核心模組（auth, router, session, datastore, monitor, scheduler）
 ├── modules/commands.js   # 所有命令登記與處理
 skills/                   # 技能模組（workerAttendance, drawingSearch）
-tools/                    # 工具模組（logger, media, pdf, weather, news…）
+tools/                    # 工具模組（logger, media, pdf, weather, news, dwgReader…）
 configs/settings.json     # 靜態配置
 data/store/               # 持久化數據（admins, blocked, groups, foremen…）
 Sample/LabourSummary/     # 考勤 Excel 範本
