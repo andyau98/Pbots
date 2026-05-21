@@ -13,6 +13,7 @@ const pdfjs = require('pdfjs-dist/legacy/build/pdf.mjs');
 const { dataStore } = require('../src/core/dataStore');
 const Tesseract = require('tesseract.js');
 const ExcelJS = require('exceljs');
+const { extractTextArrayFromDwg, isDwgReaderAvailable } = require('../tools/dwgReader');
 
 // 索引檔路徑
 const INDEX_FILE = path.join(
@@ -353,6 +354,35 @@ async function buildTgAcdMap(porPath) {
             }
         } catch (e) {
             /* 忽略 */
+        }
+
+        // 2a2: 從 DWG 內容提取繪圖編號（精度 100%，不需 OCR）
+        if (isDwgReaderAvailable()) {
+            try {
+                const allFiles = fs.readdirSync(dir);
+                const dwgFiles = allFiles.filter((f) =>
+                    f.toUpperCase().endsWith('.DWG')
+                );
+                for (const dwg of dwgFiles) {
+                    try {
+                        const dwgPath = path.join(dir, dwg);
+                        const texts = await extractTextArrayFromDwg(dwgPath);
+                        const allText = texts.join(' ');
+                        const numbers = extractDrawingNumbers(allText.toUpperCase());
+                        for (const num of numbers) {
+                            const clean = num.replace(/[-_]/g, '').toUpperCase();
+                            if (clean.length >= 6) {
+                                if (!map[clean]) map[clean] = new Set();
+                                for (const tg of tgFiles) map[clean].add(tg);
+                            }
+                        }
+                    } catch (dwgErr) {
+                        // 個別 DWG 讀取失敗，繼續下一個
+                    }
+                }
+            } catch (e) {
+                /* 忽略 */
+            }
         }
 
         // 2b: 從 Excel 提料單提取 ACD 編號（非同步、完整）
@@ -1902,6 +1932,199 @@ async function autoRebuildTask(porPath, _client) {
     return result;
 }
 
+// ========== DWG 反向查詢：加工圖號 → 位置圖 ==========
+
+/**
+ * 從 TG ACD 對照表搵出指定加工圖號對應嘅位置圖
+ * @param {string} drawingNumber - 加工圖號（如 ACD0060、ACB-ACD-0060）
+ * @returns {{ found: boolean, drawingNumber: string, layoutFiles: string[], source: string }}
+ */
+function findLayoutByFabNumber(drawingNumber) {
+    const index = loadIndex();
+    const clean = drawingNumber.replace(/[-_]/g, '').toUpperCase();
+
+    // 方法 1: TG-ACD 對照表（從 Excel + DWG 內容建立）
+    if (_tgAcdMap && _tgAcdMap[clean]) {
+        const tgPaths = Array.isArray(_tgAcdMap[clean])
+            ? _tgAcdMap[clean]
+            : [_tgAcdMap[clean]];
+        return {
+            found: true,
+            drawingNumber: clean,
+            layoutFiles: tgPaths,
+            source: 'tgAcdMap',
+        };
+    }
+
+    // 方法 2: 同目錄檔名匹配（fallback）
+    for (const f of index) {
+        const name = f.name.toUpperCase();
+        if (name.includes(clean) || clean.includes(name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ''))) {
+            const tgFiles = getTagFiles(f.path);
+            if (tgFiles.length > 0) {
+                return {
+                    found: true,
+                    drawingNumber: clean,
+                    layoutFiles: tgFiles,
+                    source: 'filename',
+                };
+            }
+        }
+    }
+
+    return { found: false, drawingNumber: clean, layoutFiles: [], source: null };
+}
+
+/**
+ * 掃描 TG 位置圖 DWG，提取其中所有加工圖號
+ * @param {string} tgPath - TG DWG 檔案路徑
+ * @returns {Promise<{numbers: string[], texts: string[], error?: string}>}
+ */
+async function scanLayoutDwg(tgPath) {
+    if (!isDwgReaderAvailable()) {
+        return { numbers: [], texts: [], error: 'dwgread 工具未安裝' };
+    }
+
+    const ext = path.extname(tgPath).toLowerCase();
+    // 若是 PDF，嘗試搵同名 DWG
+    let dwgPath = tgPath;
+    if (ext === '.pdf') {
+        const dwg = tgPath.replace(/\.pdf$/i, '.dwg').replace(/\.PDF$/, '.DWG');
+        if (fs.existsSync(dwg)) {
+            dwgPath = dwg;
+        } else {
+            return { numbers: [], texts: [], error: '找不到對應嘅 DWG 檔（CAD 線條 PDF 無法 OCR）' };
+        }
+    }
+
+    try {
+        const texts = await extractTextArrayFromDwg(dwgPath);
+        const allText = texts.join(' ');
+        const numbers = extractDrawingNumbers(allText.toUpperCase());
+        return { numbers, texts, dwgPath };
+    } catch (err) {
+        return { numbers: [], texts: [], error: err.message };
+    }
+}
+
+/**
+ * SessionManager handler: #dwgfind — 輸入加工圖號找位置圖
+ */
+function makeDwgFindHandler() {
+    return {
+        name: 'DWG 加工圖→位置圖',
+
+        async start(ctx) {
+            const available = isDwgReaderAvailable();
+            let question = '🔍 *加工圖號 → 位置圖*\n\n';
+            question += '請輸入加工圖號：\n';
+            question += '例如：`ACB-ACD-0064`、`ACD0060`\n\n';
+            if (!available) {
+                question += '⚠️ *注意：* dwgread 工具未安裝，將使用檔名匹配（準確度較低）。\n';
+            }
+            question += '輸入 `#cancel` 取消';
+            return { question };
+        },
+
+        async handleReply(ctx, replyMessage) {
+            const input = replyMessage.body.trim().toUpperCase();
+            if (input === '#CANCEL') {
+                return { done: true, result: '❌ *查詢已取消*' };
+            }
+            if (!input) {
+                return { question: '❌ 請輸入加工圖號。\n輸入 `#cancel` 取消。' };
+            }
+
+            // 查詢
+            const result = findLayoutByFabNumber(input);
+
+            if (!result.found) {
+                return {
+                    question:
+                        `❌ 找不到加工圖號 *${input}* 對應嘅位置圖。\n\n` +
+                        '可能原因：\n' +
+                        '• 圖號不在 POR 目錄中\n' +
+                        '• 請檢查圖號是否正確\n\n' +
+                        '請重新輸入，或 `#cancel` 取消。',
+                };
+            }
+
+            const tgNames = result.layoutFiles.map((p) => path.basename(p));
+            let msg = `✅ *${result.drawingNumber}* 對應嘅位置圖：\n\n`;
+            tgNames.forEach((name, i) => {
+                msg += `${i + 1}. 📄 ${name}\n`;
+            });
+            msg += `\n來源：${result.source === 'tgAcdMap' ? 'Excel 提料單 + DWG 內容' : '檔名匹配'}`;
+            msg += `\n\n💡 輸入 \`#dwgdetail ${result.drawingNumber}\` 查看位置圖包含嘅所有加工圖號`;
+
+            ctx.foundResult = result;
+
+            // 問要唔要發送位置圖
+            if (result.layoutFiles.length > 0) {
+                ctx.step = 'ask_send';
+                ctx.tgFiles = result.layoutFiles;
+                msg += '\n\n需要發送位置圖嗎？\n回覆 `y` 或 `n`';
+                return { question: msg };
+            }
+
+            return { done: true, result: msg };
+        },
+
+        async onTimeout() {
+            return '⏰ *查詢已超時*，請重新 `#dwgfind`。';
+        },
+
+        async onCancel() {
+            return '❌ *查詢已取消*';
+        },
+    };
+}
+
+// ── Helper: 處理發送確認 ──
+async function _handleDwgFindSend(ctx, replyMessage) {
+    const input = replyMessage.body.trim().toUpperCase();
+    if (input === '#CANCEL') {
+        return { done: true, result: '❌ *已取消*' };
+    }
+
+    const isYes = ['Y', 'YES', '是', '確認', 'OK'].includes(input);
+    const isNo = ['N', 'NO'].includes(input);
+
+    if (!isYes && !isNo) {
+        return { question: '❌ 請輸入 `y`（是）或 `n`（否）。' };
+    }
+
+    if (isNo || ctx.tgFiles.length === 0) {
+        return { done: true, result: '✅ *查詢完成*' };
+    }
+
+    const files = ctx.tgFiles.map((fp) => ({
+        path: fp,
+        name: path.basename(fp),
+    }));
+
+    return {
+        done: true,
+        result: `📄 *發送 ${files.length} 個位置圖檔案...*`,
+        attachments: files.map((f) => f.path),
+        attachmentCaption: files.map((f) => f.name).join(' + '),
+    };
+}
+
+// 擴充 makeDwgFindHandler 支援 ask_send 階段
+const _origMakeDwgFindHandler = makeDwgFindHandler;
+makeDwgFindHandler = function () {
+    const handler = _origMakeDwgFindHandler();
+    const origHandleReply = handler.handleReply;
+    handler.handleReply = async function (ctx, replyMessage) {
+        if (ctx.step === 'ask_send') {
+            return _handleDwgFindSend(ctx, replyMessage);
+        }
+        return origHandleReply.call(this, ctx, replyMessage);
+    };
+    return handler;
+};
+
 // ========== 匯出 ==========
 
 module.exports = {
@@ -1924,6 +2147,10 @@ module.exports = {
     get indexLoaded() {
         return _indexLoaded;
     },
+    findLayoutByFabNumber,
+    scanLayoutDwg,
+    makeDwgFindHandler,
+    isDwgReaderAvailable,
     get cachedCount() {
         return _cachedIndex ? _cachedIndex.length : 0;
     },

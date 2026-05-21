@@ -86,6 +86,11 @@ function registerAll(router) {
         isHash: true,
         aliases: ['重建索引'],
     });
+    router.register('dwgfind', dwgFindHandler, {
+        requireAuth: true,
+        isHash: true,
+        aliases: ['找位置圖', 'findlayout'],
+    });
 }
 
 // =====================================================================
@@ -751,8 +756,10 @@ async function removeForemanHandler(message, context) {
 
 const {
     makeDrawingSearchHandler,
+    makeDwgFindHandler,
     buildIndex,
     loadIndex,
+    isDwgReaderAvailable,
 } = require('../../skills/drawingSearch');
 
 async function drawingHandler(
@@ -814,6 +821,41 @@ async function rebuildIndexHandler(message, _context, _client, { config }) {
         );
     } catch (error) {
         await message.reply(`❌ 索引重建失敗: ${error.message}`);
+    }
+}
+
+// =====================================================================
+// DWG 反向查詢: #dwgfind — 輸入加工圖號 → 找對應位置圖
+// =====================================================================
+
+async function dwgFindHandler(
+    message,
+    context,
+    client,
+    { sessionManager, config }
+) {
+    if (sessionManager.hasActive(context.userId)) {
+        await message.reply('⏰ 您已有一個進行中的會話，請先完成或取消。');
+        return;
+    }
+
+    loadIndex();
+
+    const handler = makeDwgFindHandler();
+    const ctx = {};
+
+    const result = await sessionManager.start(
+        context.userId,
+        context.originId,
+        handler,
+        ctx,
+        client,
+        null,
+        context.whatsappId || context.originId
+    );
+
+    if (result.success && result.isGroup && result.message) {
+        await message.reply(result.message);
     }
 }
 
