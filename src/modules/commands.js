@@ -91,6 +91,11 @@ function registerAll(router) {
         isHash: true,
         aliases: ['找位置圖', 'findlayout'],
     });
+    router.register('rebuildTg', rebuildTgHandler, {
+        requireAuth: true,
+        isHash: true,
+        aliases: ['重建位置圖', 'rebuildtg'],
+    });
 }
 
 // =====================================================================
@@ -759,6 +764,8 @@ const {
     makeDwgFindHandler,
     buildIndex,
     loadIndex,
+    rebuildTgMapping,
+    incrementalTgUpdate,
     isDwgReaderAvailable,
 } = require('../../skills/drawingSearch');
 
@@ -856,6 +863,34 @@ async function dwgFindHandler(
 
     if (result.success && result.isGroup && result.message) {
         await message.reply(result.message);
+    }
+}
+
+// =====================================================================
+// #rebuildTg — 只重建 TG 位置圖映射（唔重建完整索引）
+// =====================================================================
+
+async function rebuildTgHandler(message, _context, _client, { config }) {
+    const porPath = config.paths?.por;
+    if (!porPath || !require('fs').existsSync(porPath)) {
+        await message.reply('❌ POR 資料夾路徑未設定或不存在。');
+        return;
+    }
+
+    await message.reply('🔄 正在重建位置圖映射索引（Deep Scan），請稍候...');
+    try {
+        const result = await rebuildTgMapping(porPath);
+        await message.reply(
+            '✅ *位置圖映射重建完成*\n\n' +
+                `📄 DWG 位置圖: ${result.dwgCount} 個\n` +
+                `🔗 生成映射: ${result.totalMappings} 條\n` +
+                `🆕 新掃描: ${result.scannedCount}\n` +
+                `📦 快取命中: ${result.cachedCount}\n` +
+                (result.errorCount > 0 ? `⚠️ 錯誤: ${result.errorCount} 個\n` : '') +
+                '\n💡 搜尋圖紙時位置圖匹配將使用此索引，響應時間 < 10ms'
+        );
+    } catch (error) {
+        await message.reply(`❌ 映射重建失敗: ${error.message}`);
     }
 }
 

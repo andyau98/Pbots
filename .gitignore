@@ -13,6 +13,9 @@ logs/
 data/chats/
 data/exports/
 data/qr-code.*
+data/store/pbots.db
+data/store/pbots.db-shm
+data/store/pbots.db-wal
 # data/store/ 目錄下的 JSON 為應用數據，應被追蹤
 
 # Backups
@@ -42,3 +45,7 @@ data/images/
 
 # PM2
 ecosystem.config.js
+
+# Temporary/dev artifacts
+_tmp_*.js
+nul'

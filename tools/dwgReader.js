@@ -2,9 +2,7 @@
  * DWG 文字提取工具 — 從 AutoCAD DWG 檔直接提取文字（不需 OCR）
  *
  * 依賴：libredwg 的 dwgread 工具
- *   - Windows: libredwg-0.13.4-win64.zip (已含在 repo)
- *   - macOS:   需自行編譯 (brew install autoconf automake libtool pkg-config)
- *   - Linux:   需自行編譯
+ *   - Windows: libredwg-0.13.4-win64.zip (已含在 repo tools/libredwg/)
  *
  * 用法：
  *   const { extractTextFromDwg } = require('../tools/dwgReader');
@@ -58,29 +56,45 @@ function getDwgreadPath() {
 // ── DWG 文字提取 ──
 
 /**
- * 執行 dwgread 並回傳 JSON
+ * 修正 dwgread JSON 輸出中嘅非法值（nan、不完整小數等）
  */
-function runDwgread(dwgPath) {
+function fixDwgJson(raw) {
+    return raw
+        .replace(/:\s*nan\b/g, ': null')
+        .replace(/\[\s*nan\b/g, '[ null')
+        .replace(/,\s*nan\b/g, ', null')
+        .replace(/\.(?=[\s,\}\]])/g, '.0');
+}
+
+/**
+ * 執行 dwgread 並回傳 JSON
+ * @param {string} dwgPath - DWG 檔案路徑
+ * @param {number} [timeout=120000] - 超時時間（毫秒）
+ */
+function runDwgread(dwgPath, timeout = 120000) {
     const exe = getDwgreadPath();
     if (!exe) {
         return Promise.reject(new Error('找不到 dwgread 工具。請安裝 libredwg。'));
     }
 
     return new Promise((resolve, reject) => {
-        // 設定 DYLD_LIBRARY_PATH (macOS)
+        // Windows: 將 libredwg 目錄加入 PATH 以便載入 DLL
         const env = { ...process.env };
-        if (os.platform() === 'darwin') {
-            const libDir = path.dirname(exe).replace('programs', 'src');
+        const exeDir = path.dirname(exe);
+        if (os.platform() === 'win32') {
+            env.PATH = exeDir + path.delimiter + (env.PATH || '');
+        } else if (os.platform() === 'darwin') {
+            const libDir = exeDir.replace('programs', 'src');
             env.DYLD_LIBRARY_PATH = (env.DYLD_LIBRARY_PATH || '') + ':' + libDir;
         }
 
-        execFile(exe, ['-O', 'JSON', dwgPath], {
-            timeout: 60000,
-            maxBuffer: 50 * 1024 * 1024, // 50MB
+        // 輸出到暫存檔（避免 stdout buffer 上限 + 處理效率）
+        const tmpOut = path.join(os.tmpdir(), `dwg_${Date.now()}_${path.basename(dwgPath)}.json`);
+        execFile(exe, ['-O', 'minJSON', '-o', tmpOut, dwgPath], {
+            timeout,
             env,
-            encoding: 'buffer', // binary mode, 手動 decode 處理非 UTF-8 字元
         }, (err, stdout, stderr) => {
-            if (err) {
+            if (err && !fs.existsSync(tmpOut)) {
                 const errMsg = stderr
                     ? stderr.toString('utf-8').slice(0, 300)
                     : err.message;
@@ -88,11 +102,18 @@ function runDwgread(dwgPath) {
                 return;
             }
             try {
-                const raw = stdout.toString('utf-8');
+                let raw = fs.readFileSync(tmpOut, 'utf-8');
+                cleaned = true;
+
+                // 修正 libredwg 0.13.4 JSON 輸出嘅問題（nan、不完整小數）
+                raw = fixDwgJson(raw);
+
                 const data = JSON.parse(raw);
                 resolve(data);
             } catch (e) {
                 reject(new Error(`JSON 解析失敗: ${e.message}`));
+            } finally {
+                try { fs.unlinkSync(tmpOut); } catch { /* ignore */ }
             }
         });
     });
@@ -167,20 +188,22 @@ function parseDwgJson(data) {
 /**
  * 從 DWG 檔提取所有文字
  * @param {string} dwgPath - DWG 檔案路徑
+ * @param {number} [timeout] - dwgread 超時時間（毫秒），預設 120s
  * @returns {Promise<Array<{text: string, entity: string}>>}
  */
-async function extractTextFromDwg(dwgPath) {
-    const data = await runDwgread(dwgPath);
+async function extractTextFromDwg(dwgPath, timeout) {
+    const data = await runDwgread(dwgPath, timeout);
     return parseDwgJson(data);
 }
 
 /**
  * 從 DWG 提取文字並回傳純文字陣列
  * @param {string} dwgPath
+ * @param {number} [timeout] - dwgread 超時時間（毫秒），預設 120s
  * @returns {Promise<string[]>}
  */
-async function extractTextArrayFromDwg(dwgPath) {
-    const entries = await extractTextFromDwg(dwgPath);
+async function extractTextArrayFromDwg(dwgPath, timeout) {
+    const entries = await extractTextFromDwg(dwgPath, timeout);
     return [...new Set(entries.map(e => e.text))];
 }
 

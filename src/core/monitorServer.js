@@ -8,6 +8,7 @@
 
 const http = require('http');
 const { logStream } = require('./logStream');
+const drawingSearch = require('../../skills/drawingSearch');
 
 class MonitorServer {
     constructor(port = 3456) {
@@ -34,6 +35,15 @@ class MonitorServer {
                     break;
                 case '/api/logs/stream':
                     this._serveSse(req, res);
+                    break;
+                case '/api/deepscan/progress':
+                    this._serveDeepscanProgress(res);
+                    break;
+                case '/deepscan':
+                    this._serveDeepscanPage(res);
+                    break;
+                case '/api/deepscan/start':
+                    this._serveDeepscanStart(res);
                     break;
                 default:
                     res.writeHead(404);
@@ -209,8 +219,62 @@ class MonitorServer {
                 })),
                 commandPrefix: config?.bot?.prefix || '!',
                 version: config?.project?.version || '1.0.0',
+                qrDataUrl: this._qrDataUrl || null,
             })
         );
+    }
+
+    // ========== DeepScan Progress API ==========
+
+    _serveDeepscanProgress(res) {
+        const p = drawingSearch.deepscanProgress || {};
+        const elapsed = p.startTime ? (Date.now() - new Date(p.startTime).getTime()) : 0;
+        const pct = p.total > 0 ? Math.min(100, Math.round(p.current / p.total * 100)) : 0;
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+            running: p.running || false,
+            total: p.total || 0,
+            current: p.current || 0,
+            percent: pct,
+            currentFile: p.currentFile || '',
+            scannedCount: p.scannedCount || 0,
+            cachedCount: p.cachedCount || 0,
+            errorCount: p.errorCount || 0,
+            mappingCount: p.mappingCount || 0,
+            dwgCount: p.dwgCount || 0,
+            phase: p.phase || '',
+            elapsedMs: elapsed,
+            elapsedText: formatDuration(elapsed),
+            startTime: p.startTime || '',
+        }));
+    }
+
+    _serveDeepscanPage(res) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(buildDeepscanPage());
+    }
+
+    _serveDeepscanStart(res) {
+        if (drawingSearch.deepscanProgress.running) {
+            res.writeHead(409);
+            return res.end(JSON.stringify({ error: '已有掃描正在執行' }));
+        }
+
+        const config = require('../../configs/settings.json');
+        const porPath = config.paths?.por;
+        if (!porPath) {
+            res.writeHead(400);
+            return res.end(JSON.stringify({ error: 'POR 路徑未設定' }));
+        }
+
+        // 異步啟動掃描（唔 block response）
+        drawingSearch.rebuildTgMapping(porPath).catch(err => {
+            console.error('Deep Scan 錯誤:', err);
+        });
+
+        res.writeHead(202);
+        res.end(JSON.stringify({ message: '掃描已啟動', por: porPath }));
     }
 }
 
@@ -480,6 +544,18 @@ async function fetchStatus() {
       document.getElementById("dashboard").classList.remove("hidden");
       document.getElementById("status-indicator").innerHTML = '<span class="dot on"></span><span>已連接</span><span style="margin-left:6px" id="refresh-time"></span>';
     }
+    // 動態更新 QR Code（如果頁面載入時仲未生成）
+    if (!isReady && d.qrDataUrl) {
+      var qrSection = document.getElementById("qr-section");
+      if (qrSection) {
+        var existingImg = qrSection.querySelector("img");
+        if (existingImg) {
+          existingImg.src = d.qrDataUrl;
+        } else {
+          qrSection.innerHTML = '<h2>📱 請用 WhatsApp 掃描 QR Code</h2><img src="' + d.qrDataUrl + '" alt="QR Code" style="max-width:280px;border:3px solid #25D366;border-radius:12px;padding:12px;background:#fff"><p style="color:var(--t3);font-size:0.75rem;margin-top:12px">掃描成功後頁面自動切換為監控儀表板</p>';
+        }
+      }
+    }
     if (isReady) updateDashboard(d);
     document.getElementById("refresh-time").textContent = new Date().toLocaleTimeString("zh-HK",{hour12:false});
   } catch(err) {}
@@ -565,6 +641,120 @@ function updateDashboard(d) {
 }
 
 fetchStatus(); setInterval(fetchStatus, 5000);
+</script>
+</body>
+</html>`;
+}
+
+// ========== DeepScan 進度頁面 ==========
+
+function formatDuration(ms) {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return h + 'h ' + m + 'm ' + sec + 's';
+    if (m > 0) return m + 'm ' + sec + 's';
+    return sec + 's';
+}
+
+function buildDeepscanPage() {
+    return `<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PBOTS Deep Scan 進度</title>
+<style>
+:root{--bg:#0a0f1a;--srf:#111827;--srf2:#161f30;--bd:#1e293b;--tx:#e2e8f0;--t2:#94a3b8;--t3:#64748b;--ac:#38bdf8;--gn:#22c55e;--rd:#ef4444;--am:#f59e0b}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+.container{max-width:600px;width:100%;background:var(--srf);border:1px solid var(--bd);border-radius:16px;padding:32px}
+h1{font-size:1.2rem;color:var(--ac);margin-bottom:8px;text-align:center}
+.sub{font-size:0.75rem;color:var(--t3);text-align:center;margin-bottom:24px}
+.progress-wrap{background:var(--srf2);border-radius:12px;padding:24px;margin-bottom:16px}
+.progress-label{display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:8px}
+.progress-label .pct{color:var(--ac);font-weight:700;font-size:1.5rem}
+.progress-label .count{color:var(--t2)}
+.bar-bg{height:20px;background:var(--bd);border-radius:10px;overflow:hidden;margin-bottom:12px}
+.bar-fill{height:100%;background:linear-gradient(90deg,var(--ac),var(--gn));border-radius:10px;transition:width .5s ease;width:0%}
+.filename{font-size:0.75rem;color:var(--t2);font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:4px 0}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:16px}
+.stat-box{background:var(--srf2);border-radius:8px;padding:12px;text-align:center}
+.stat-box .num{font-size:1.3rem;font-weight:700;color:var(--tx)}
+.stat-box .lbl{font-size:0.65rem;color:var(--t3);margin-top:2px}
+.stat-box .num.gn{color:var(--gn)}
+.stat-box .num.am{color:var(--am)}
+.stat-box .num.rd{color:var(--rd)}
+.phase{display:flex;justify-content:center;align-items:center;gap:8px;font-size:0.8rem;color:var(--t2);padding:8px}
+.phase .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top:2px solid var(--ac);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.phase.done{color:var(--gn)}
+.phase.done .spinner{display:none}
+.phase.idle .spinner{display:none}
+.back-link{display:block;text-align:center;margin-top:16px;font-size:0.75rem;color:var(--t3)}
+.back-link a{color:var(--ac);text-decoration:none}
+.back-link a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔍 TG Deep Scan</h1>
+  <div class="sub">位置圖 DWG 預建索引進度</div>
+
+  <div class="progress-wrap">
+    <div class="progress-label">
+      <span class="pct" id="pct">0%</span>
+      <span class="count" id="count">0 / 0</span>
+    </div>
+    <div class="bar-bg"><div class="bar-fill" id="bar"></div></div>
+    <div class="filename" id="filename">—</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-box"><div class="num" id="s-scanned">0</div><div class="lbl">已掃描</div></div>
+    <div class="stat-box"><div class="num" id="s-cached">0</div><div class="lbl">快取命中</div></div>
+    <div class="stat-box"><div class="num gn" id="s-mappings">0</div><div class="lbl">映射數</div></div>
+    <div class="stat-box"><div class="num am" id="s-errors">0</div><div class="lbl">錯誤</div></div>
+  </div>
+
+  <div class="phase idle" id="phase">
+    <span class="spinner"></span>
+    <span id="phase-text">等待掃描…</span>
+  </div>
+
+  <div id="time-info" style="text-align:center;font-size:0.7rem;color:var(--t3)"></div>
+
+  <div class="back-link"><a href="/">← 返回儀表板</a></div>
+</div>
+
+<script>
+function fmt(s) { return Math.floor(s / 60) + "m " + (s % 60) + "s"; }
+
+async function poll() {
+    try {
+        var r = await fetch("/api/deepscan/progress");
+        var d = await r.json();
+
+        document.getElementById("pct").textContent = d.percent + "%";
+        document.getElementById("count").textContent = d.current + " / " + d.total;
+        document.getElementById("bar").style.width = d.percent + "%";
+        document.getElementById("filename").textContent = d.currentFile || "—";
+        document.getElementById("s-scanned").textContent = d.scannedCount;
+        document.getElementById("s-cached").textContent = d.cachedCount;
+        document.getElementById("s-mappings").textContent = d.mappingCount;
+        document.getElementById("s-errors").textContent = d.errorCount;
+        document.getElementById("phase-text").textContent = d.phase || (d.running ? "掃描中…" : "待機");
+        document.getElementById("time-info").textContent = "已用 " + d.elapsedText;
+
+        var phase = document.getElementById("phase");
+        phase.className = "phase";
+        if (!d.running) phase.classList.add("done");
+
+    } catch(e) {}
+    setTimeout(poll, 1000);
+}
+poll();
 </script>
 </body>
 </html>`;

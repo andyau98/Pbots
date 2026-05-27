@@ -1,0 +1,12 @@
+# PBOTS 圖紙提取引擎依賴
+# pip install -r requirements.txt
+
+# ── 核心依賴（必要） ──
+ezdxf>=1.2.0          # DXF 讀取（跨平台，僅限 .dxf）
+
+# ── Windows COM（可選，僅讀 .dwg 需要） ──
+pywin32>=306          # win32com + AutoCAD COM 介面
+
+# ── 轉換輔助（可選） ──
+# ODA File Converter 為獨立 EXE，不需 pip 安裝
+# 下載: https://www.opendesign.com/oda_file_converter

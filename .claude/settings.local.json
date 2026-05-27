@@ -1,22 +1,24 @@
 {
-    "permissions": {
-        "allow": [
-            "Bash(npm start *)",
-            "Bash(taskkill /F /IM node.exe)",
-            "Bash(exit 0)",
-            "Bash(npm install *)",
-            "Bash(taskkill /F /IM chrome.exe)",
-            "Bash(taskkill /F /IM chrome.exe /T)",
-            "Bash(taskkill /F /IM node.exe /T)",
-            "Bash(tasklist)",
-            "Bash(powershell -Command \"Get-Process -Name 'chrome' -ErrorAction SilentlyContinue | Stop-Process -Force\")",
-            "Bash(node src/index.js)",
-            "Bash(curl -s \"https://news.google.com/rss/search?q=%E9%A6%99%E6%B8%AF+%E5%9C%B0%E7%9B%A4+%E6%84%8F%E5%A4%96&hl=zh-HK&gl=HK&ceid=HK:zh-Hant\" -H \"User-Agent: Mozilla/5.0\")",
-            "Bash(node -e ' *)",
-            "Read(//c/Windows/Fonts/**)",
-            "Bash(grep -i -E \"\\\\.ttf$\")",
-            "Bash(sleep 8 && cat /c/Users/HFTC/AppData/Local/Temp/claude/c--Users-HFTC-Documents-trae-projects-PBOTS/95ed07d8-38b8-4014-a8c0-d833cba0e2e0/tasks/bdll9v684.output)",
-            "Read(//c/Users/HFTC/AppData/Local/Temp/claude/c--Users-HFTC-Documents-trae-projects-PBOTS/95ed07d8-38b8-4014-a8c0-d833cba0e2e0/tasks/**)"
-        ]
-    }
+  "permissions": {
+    "allow": [
+      "Bash(npm start *)",
+      "Bash(taskkill /F /IM node.exe)",
+      "Bash(exit 0)",
+      "Bash(npm install *)",
+      "Bash(taskkill /F /IM chrome.exe)",
+      "Bash(taskkill /F /IM chrome.exe /T)",
+      "Bash(taskkill /F /IM node.exe /T)",
+      "Bash(tasklist)",
+      "Bash(powershell -Command \"Get-Process -Name 'chrome' -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(node src/index.js)",
+      "Bash(curl -s \"https://news.google.com/rss/search?q=%E9%A6%99%E6%B8%AF+%E5%9C%B0%E7%9B%A4+%E6%84%8F%E5%A4%96&hl=zh-HK&gl=HK&ceid=HK:zh-Hant\" -H \"User-Agent: Mozilla/5.0\")",
+      "Bash(node -e ' *)",
+      "Read(//c/Windows/Fonts/**)",
+      "Bash(grep -i -E \"\\\\.ttf$\")",
+      "Bash(sleep 8 && cat /c/Users/HFTC/AppData/Local/Temp/claude/c--Users-HFTC-Documents-trae-projects-PBOTS/95ed07d8-38b8-4014-a8c0-d833cba0e2e0/tasks/bdll9v684.output)",
+      "Read(//c/Users/HFTC/AppData/Local/Temp/claude/c--Users-HFTC-Documents-trae-projects-PBOTS/95ed07d8-38b8-4014-a8c0-d833cba0e2e0/tasks/**)",
+      "Bash(start \"TGScan\" cmd /c \"cd /d c:\\\\Users\\\\HFTC\\\\Documents\\\\trae_projects\\\\PBOTS && node tmp/scan_all_tg.js\")"
+    ],
+    "defaultMode": "bypassPermissions"
+  }
 }
