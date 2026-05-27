@@ -25,10 +25,10 @@ class ErrorRecovery {
     recordError(error, context = {}) {
         const errorRecord = {
             timestamp: new Date().toISOString(),
-            error: error.message || error.toString(),
-            stack: error.stack,
+            error: error ? (error.message || error.toString()) : 'unknown error',
+            stack: error ? error.stack : null,
             context: context,
-            type: this.classifyError(error),
+            type: error ? this.classifyError(error) : 'unknown',
         };
 
         this.errorBuffer.push(errorRecord);

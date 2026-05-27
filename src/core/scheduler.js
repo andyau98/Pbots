@@ -48,13 +48,13 @@ class Scheduler {
         this._jobs.push(attendanceJob);
         console.log('⏰ 排程已設定: 每日 9:00 AM (週一至六) 觸發考勤申報');
 
-        // 每日凌晨 3:00 AM — 重建圖紙索引
+        // 每日中午 12:00 — 重建圖紙索引（配合工作時段 09:00-18:00）
         if (config?.paths?.por) {
             const porPath = config.paths.por;
             const rebuildJob = cron.schedule(
-                '0 3 * * *',
+                '0 12 * * *',
                 () => {
-                    console.log('⏰ [Scheduler] 觸發圖紙索引重建 (3:00 AM)');
+                    console.log('⏰ [Scheduler] 觸發圖紙索引重建 (12:00 PM)');
                     (async () => {
                         try {
                             const {
@@ -73,7 +73,7 @@ class Scheduler {
             );
 
             this._jobs.push(rebuildJob);
-            console.log('⏰ 排程已設定: 每日凌晨 3:00 AM 重建圖紙索引');
+            console.log('⏰ 排程已設定: 每日中午 12:00 PM 重建圖紙索引');
         }
     }
 

@@ -46,6 +46,9 @@ function findDwgread() {
 // 已快取路徑
 let _dwgreadPath = null;
 
+// 追蹤執行中嘅 child PID，kill 時只殺自己嘅 zombie 唔會影響其他並行提取
+const _activePids = new Set();
+
 function getDwgreadPath() {
     if (_dwgreadPath === null) {
         _dwgreadPath = findDwgread();
@@ -57,13 +60,41 @@ function getDwgreadPath() {
 
 /**
  * 修正 dwgread JSON 輸出中嘅非法值（nan、不完整小數等）
+ * 只修正明顯係 JSON number 嘅值，唔會破壞字串內容
  */
 function fixDwgJson(raw) {
     return raw
         .replace(/:\s*nan\b/g, ': null')
         .replace(/\[\s*nan\b/g, '[ null')
         .replace(/,\s*nan\b/g, ', null')
-        .replace(/\.(?=[\s,\}\]])/g, '.0');
+        // 只修正數字後面嘅不完整小數（如 [1.] → [1.0]），唔會破壞字串文字
+        .replace(/(\d)\.(\s*[,\]}\]\)])/g, '$1.0$2');
+}
+
+/**
+ * 喺 Windows kill dwgread process tree（防止 timeout 後 zombie）
+ * @param {number} [pid] - 指定嘅 PID，冇指定時 kill 所有追蹤中嘅 zombie
+ */
+function killHungDwgread(pid) {
+    if (os.platform() !== 'win32') return;
+    try {
+        if (pid !== undefined) {
+            require('child_process').execSync(
+                `taskkill //F //PID ${pid} //T 2>nul`,
+                { timeout: 3000 }
+            );
+        } else {
+            // 冇指定 PID → kill 所有 known 嘅 active pid（唔會誤殺其他並行提取）
+            for (const activePid of _activePids) {
+                try {
+                    require('child_process').execSync(
+                        `taskkill //F //PID ${activePid} //T 2>nul`,
+                        { timeout: 3000 }
+                    );
+                } catch { /* 可能已結束 */ }
+            }
+        }
+    } catch { /* ignore */ }
 }
 
 /**
@@ -77,6 +108,9 @@ function runDwgread(dwgPath, timeout = 120000) {
         return Promise.reject(new Error('找不到 dwgread 工具。請安裝 libredwg。'));
     }
 
+    // 每次執行前 kill 之前殘留嘅 zombie process
+    killHungDwgread();
+
     return new Promise((resolve, reject) => {
         // Windows: 將 libredwg 目錄加入 PATH 以便載入 DLL
         const env = { ...process.env };
@@ -89,11 +123,25 @@ function runDwgread(dwgPath, timeout = 120000) {
         }
 
         // 輸出到暫存檔（避免 stdout buffer 上限 + 處理效率）
-        const tmpOut = path.join(os.tmpdir(), `dwg_${Date.now()}_${path.basename(dwgPath)}.json`);
-        execFile(exe, ['-O', 'minJSON', '-o', tmpOut, dwgPath], {
-            timeout,
+        const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const tmpOut = path.join(os.tmpdir(), `dwg_${uniqueId}_${path.basename(dwgPath)}.json`);
+
+        // 自家 timeout 機制（Windows execFile timeout 唔會 kill child process）
+        let timedOut = false;
+        let childPid = null;
+        const timer = setTimeout(() => {
+            timedOut = true;
+            if (childPid !== null) killHungDwgread(childPid);
+            reject(new Error(`dwgread 超時 (${timeout}ms): ${dwgPath}`));
+        }, timeout);
+
+        const child = execFile(exe, ['-O', 'minJSON', '-o', tmpOut, dwgPath], {
+            timeout: timeout + 5000, // 比自家 timeout 長少少，等 callback 唔會 race
             env,
         }, (err, stdout, stderr) => {
+            clearTimeout(timer);
+            if (timedOut) return; // 已經 reject 咗
+
             if (err && !fs.existsSync(tmpOut)) {
                 const errMsg = stderr
                     ? stderr.toString('utf-8').slice(0, 300)
@@ -103,7 +151,6 @@ function runDwgread(dwgPath, timeout = 120000) {
             }
             try {
                 let raw = fs.readFileSync(tmpOut, 'utf-8');
-                cleaned = true;
 
                 // 修正 libredwg 0.13.4 JSON 輸出嘅問題（nan、不完整小數）
                 raw = fixDwgJson(raw);
@@ -114,6 +161,19 @@ function runDwgread(dwgPath, timeout = 120000) {
                 reject(new Error(`JSON 解析失敗: ${e.message}`));
             } finally {
                 try { fs.unlinkSync(tmpOut); } catch { /* ignore */ }
+            }
+        });
+
+        // 追蹤 PID 以便精準 kill（唔影響並行提取）
+        childPid = child.pid;
+        if (childPid) _activePids.add(childPid);
+
+        // 額外保險：child exit 後移除 PID 紀錄
+        child.on('exit', () => {
+            clearTimeout(timer);
+            if (childPid) {
+                _activePids.delete(childPid);
+                killHungDwgread(childPid);
             }
         });
     });

@@ -91,8 +91,17 @@ class CleanupManager {
                 counter++;
             }
 
-            // 移動文件
-            fs.renameSync(fileInfo.path, finalBackupPath);
+            // 移動文件（跨磁碟時改為 copy + unlink）
+            try {
+                fs.renameSync(fileInfo.path, finalBackupPath);
+            } catch (renameErr) {
+                if (renameErr.code === 'EXDEV') {
+                    fs.copyFileSync(fileInfo.path, finalBackupPath);
+                    fs.unlinkSync(fileInfo.path);
+                } else {
+                    throw renameErr;
+                }
+            }
 
             return {
                 success: true,

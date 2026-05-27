@@ -59,6 +59,8 @@ class SessionManager {
         this._sessions = new Map();
         /** @type {Map<string, string>} groupId → userId  群組鎖定 */
         this._groupLocks = new Map();
+        /** @type {Set<string>} userId → 正在處理中，防止 re-entrant */
+        this._processing = new Set();
         this._defaultTimeout = 5 * 60 * 1000; // 5 分鐘
     }
 
@@ -85,7 +87,7 @@ class SessionManager {
         // 群組鎖定：記錄此群組正被哪個用戶鎖定
         if (isGroup) {
             // 如果群組已被其他用戶鎖定，拒絕
-            const existingOwner = this._groupLocks.get(originId);
+            const existingOwner = this.getGroupLock(originId);
             if (existingOwner && existingOwner !== userId) {
                 console.log(
                     `⛔ 群組 ${originId} 已被用戶 ${existingOwner} 鎖定，拒絕 ${userId}`
@@ -246,6 +248,12 @@ class SessionManager {
     async routeMessage(userId, message, client) {
         if (!this.hasActive(userId)) return false;
 
+        // 防止 re-entrant：同一用戶有多條訊息同時進入
+        if (this._processing.has(userId)) {
+            console.log(`⏳ [SessionManager] ${userId} 正在處理中，跳過重複調用`);
+            return true;
+        }
+
         const session = this.get(userId);
         if (!session) return false;
 
@@ -276,10 +284,21 @@ class SessionManager {
         const handler = session.handler;
         const ctx = session.context;
 
+        // 標記為處理中，防止 re-entrant
+        this._processing.add(userId);
+
         try {
             const result = await handler.handleReply(ctx, message);
 
             if (!result) {
+                this.end(userId);
+                return true;
+            }
+
+            // 驗證 handler 回傳值：若 done 同 question 都冇，當係無效回傳終止會話
+            if (!result.done && !result.question) {
+                console.warn(`⚠️ [SessionManager] ${handler.name} 回傳無效值，終止會話`);
+                await this._sendDM(userId, '❌ 處理程式回傳無效，會話已終止。', client).catch(() => {});
                 this.end(userId);
                 return true;
             }
@@ -298,6 +317,20 @@ class SessionManager {
                 const attachments =
                     result.attachments ||
                     (result.attachment ? [result.attachment] : []);
+
+                // 多附件時先發 attachmentCaption 做摘要
+                if (attachments.length > 1 && result.attachmentCaption) {
+                    try {
+                        await this._sendToOrigin(
+                            session.originId,
+                            result.attachmentCaption,
+                            client
+                        );
+                    } catch (captionErr) {
+                        console.warn(`⚠️ [SessionManager] 發送附件摘要失敗:`, captionErr.message);
+                    }
+                }
+
                 for (const attPath of attachments) {
                     try {
                         // Normalize path: use forward slashes to avoid Windows issues
@@ -317,11 +350,13 @@ class SessionManager {
                             `❌ [SessionManager] 發送附件失敗 (${attPath}):`,
                             attErr.message
                         );
-                        await this._sendToOrigin(
-                            session.originId,
-                            `⚠️ 附件發送失敗: ${attErr.message}`,
-                            client
-                        );
+                        try {
+                            await this._sendToOrigin(
+                                session.originId,
+                                `⚠️ 附件發送失敗: ${attErr.message}`,
+                                client
+                            );
+                        } catch {}
                     }
                 }
                 // 發送完成訊息
@@ -332,7 +367,9 @@ class SessionManager {
                             result.completionMessage,
                             client
                         );
-                    } catch {}
+                    } catch (compErr) {
+                        console.warn(`⚠️ [SessionManager] 發送完成訊息失敗:`, compErr.message);
+                    }
                 }
                 this.end(userId);
                 console.log(
@@ -342,11 +379,15 @@ class SessionManager {
                 // Phase 7 確認回饋：先發送「✅ 收到: {用戶輸入}」，再發下一條問題
                 const userInput = message.body?.trim();
                 if (userInput && !message.hasMedia && userInput !== '#cancel') {
-                    await this._sendDM(
-                        userId,
-                        `✅ *收到:* ${userInput.substring(0, 100)}`,
-                        client
-                    );
+                    try {
+                        await this._sendDM(
+                            userId,
+                            `✅ *收到:* ${userInput.substring(0, 100)}`,
+                            client
+                        );
+                    } catch (feedbackErr) {
+                        console.warn(`⚠️ [SessionManager] 發送回饋失敗:`, feedbackErr.message);
+                    }
                 }
 
                 // 發送下一條問題到用戶私訊
@@ -368,9 +409,13 @@ class SessionManager {
                     `❌ 處理失敗: ${error.message}\n請重新開始。`,
                     client
                 );
-            } catch {}
+            } catch (errNotifyErr) {
+                console.warn(`⚠️ [SessionManager] 發送錯誤通知失敗:`, errNotifyErr.message);
+            }
             this.end(userId);
             return true;
+        } finally {
+            this._processing.delete(userId);
         }
     }
 
@@ -381,6 +426,11 @@ class SessionManager {
      * @param {string} [senderId] - 發送者的完整 WhatsApp ID（含 @c.us 或 @lid 後綴），用於發送私訊
      */
     async start(userId, originId, handler, context, client, timeout, senderId) {
+        // 防止 re-entrant
+        if (this._processing.has(userId)) {
+            return { success: false, message: '⏳ 您有正在處理中的請求，請稍後再試。' };
+        }
+
         context = context || {};
 
         // 建立會話（包含群組鎖定 + senderId 用於正確的 DM 格式）
@@ -431,6 +481,7 @@ class SessionManager {
                 return {
                     success: true,
                     isGroup: true,
+                    handled: true,
                     message: `📬 已向您發送私訊，請在私訊中繼續操作 *${handler.name}*。\n\n⚠️ 此群組已鎖定，其他人無法干擾您的會話。`,
                 };
             }

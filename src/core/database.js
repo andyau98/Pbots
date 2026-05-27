@@ -156,6 +156,27 @@ class AppDatabase {
         `).get();
     }
 
+    /**
+     * 清理 TG 快取：刪除指定檔案路徑以外嘅 entries
+     * 或者刪除所有冇 drawing_numbers 嘅空快取
+     * @param {string[]} [keepPaths] - 保留嘅檔案路徑列表（可選）
+     * @returns {number} 已刪除數量
+     */
+    cleanupTgCache(keepPaths) {
+        if (Array.isArray(keepPaths) && keepPaths.length > 0) {
+            const placeholders = keepPaths.map(() => '?').join(',');
+            const result = this.db.prepare(
+                `DELETE FROM tg_cache WHERE file_path NOT IN (${placeholders})`
+            ).run(...keepPaths);
+            return result.changes;
+        }
+        // 預設：刪除無內容嘅空快取
+        const result = this.db.prepare(
+            "DELETE FROM tg_cache WHERE drawing_numbers = '[]' OR drawing_numbers = ''"
+        ).run();
+        return result.changes;
+    }
+
     /** 關閉連線 */
     close() {
         this.db.close();

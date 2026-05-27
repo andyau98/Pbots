@@ -42,10 +42,8 @@ class AuthManager {
         return dataStore.getAdmins();
     }
 
-    /** 獲取管理員數量（含 @ Set 相容） */
+    /** 獲取管理員數量 */
     get adminNumbers() {
-        const set = new Set(dataStore.getAdmins());
-        set.size; // trigger property
         return {
             size: dataStore.getAdmins().length,
             has: (id) => dataStore.isAdmin(id),
@@ -344,8 +342,10 @@ class AuthManager {
         text += '• #今日人數 - 查詢今日申報\n';
 
         text += '\n*📦 圖紙:*\n';
-        text += '• #Drawing - 搜尋加工圖\n';
+        text += '• #Drawing / #圖紙 - 搜尋加工圖\n';
         text += '• #searchpor - 重建圖紙索引\n';
+        text += '• #dwgfind / #找位置圖 - 加工圖號→位置圖\n';
+        text += '• #rebuildTg - 重建位置圖映射\n';
 
         if (permission.hasFullAccess) {
             text += '\n*👑 管理:*\n';
@@ -464,10 +464,12 @@ class AuthManager {
 
     // ========== 內部：發送私信 ==========
 
-    async _sendPrivateMessage(userId, messageText, client) {
+    async _sendPrivateMessage(userId, messageText, client, originId) {
         try {
             let target = userId;
-            if (!target.includes('@')) target += '@c.us';
+            if (!target.includes('@')) {
+                target += (originId && originId.includes('@lid')) ? '@lid' : '@c.us';
+            }
             await client.sendMessage(target, messageText);
             return true;
         } catch (error) {

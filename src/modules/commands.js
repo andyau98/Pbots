@@ -259,6 +259,8 @@ async function whitelistHandler(
                         '#TOPDF - 照片收集→PDF\n' +
                         '#申報 - 考勤申報\n' +
                         '#登記判頭 - 登記判頭\n' +
+                        '#Drawing - 圖紙搜尋\n' +
+                        '#dwgfind - 加工圖號→位置圖\n' +
                         '!security - 安全狀態\n' +
                         '!cleanup - 系統清理',
                 };
@@ -659,10 +661,12 @@ async function reportHandler(message, context, client, { sessionManager }) {
         {},
         client,
         null,
-        context.whatsappId || context.originId
+        context.whatsappId || (context.isGroup ? null : context.originId)
     );
 
-    if (result.success && result.isGroup && result.message) {
+    if (!result.success) {
+        await message.reply(result.message || '❌ 啟動申報失敗');
+    } else if (result.isGroup && result.message) {
         await message.reply(result.message);
     }
 }
@@ -676,9 +680,9 @@ async function todayCountHandler(message) {
 
     let text = '📊 *今日開工人數*\n\n';
     text += `📅 日期: ${new Date().toLocaleDateString('zh-HK')}\n\n`;
+    const counts = report.counts || {};
     for (const company of report.headerRow || []) {
-        const count =
-            report.counts[company] !== undefined ? report.counts[company] : '-';
+        const count = counts[company] !== undefined ? counts[company] : '-';
         text += `• *${company}*: ${count} 人\n`;
     }
     text += `\n👷 *總數: ${report.total} 人*`;
@@ -720,10 +724,12 @@ async function registerForemanHandler(
         },
         client,
         null,
-        context.whatsappId || context.originId
+        context.whatsappId || (context.isGroup ? null : context.originId)
     );
 
-    if (result.success && result.isGroup && result.message) {
+    if (!result.success) {
+        await message.reply(result.message || '❌ 啟動登記失敗');
+    } else if (result.isGroup && result.message) {
         await message.reply(result.message);
     }
 }
@@ -803,10 +809,12 @@ async function drawingHandler(
         ctx,
         client,
         null,
-        context.whatsappId || context.originId
+        context.whatsappId || (context.isGroup ? null : context.originId)
     );
 
-    if (result.success && result.isGroup && result.message) {
+    if (!result.success) {
+        await message.reply(result.message || '❌ 啟動圖紙搜尋失敗');
+    } else if (result.isGroup && result.message) {
         await message.reply(result.message);
     }
 }
@@ -858,10 +866,12 @@ async function dwgFindHandler(
         ctx,
         client,
         null,
-        context.whatsappId || context.originId
+        context.whatsappId || (context.isGroup ? null : context.originId)
     );
 
-    if (result.success && result.isGroup && result.message) {
+    if (!result.success) {
+        await message.reply(result.message || '❌ 啟動位置圖查詢失敗');
+    } else if (result.isGroup && result.message) {
         await message.reply(result.message);
     }
 }
@@ -877,7 +887,7 @@ async function rebuildTgHandler(message, _context, _client, { config }) {
         return;
     }
 
-    await message.reply('🔄 正在重建位置圖映射索引（Deep Scan），請稍候...');
+    await message.reply('🔄 正在重建位置圖映射索引，需時較長請稍候...');
     try {
         const result = await rebuildTgMapping(porPath);
         await message.reply(

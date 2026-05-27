@@ -208,7 +208,7 @@ src/
 │   ├── database.js           # SQLite 資料庫（better-sqlite3），取代 JSON 儲存圖紙索引
 │   ├── monitorServer.js      # HTTP 監控儀表板（localhost:3456，6卡 + SSE 日誌串流）
 │   ├── logStream.js          # SSE 即時日誌串流（攔截 console.log/warn/error）
-│   └── scheduler.js          # node-cron 排程（9:00 AM 考勤 + 3:00 AM 圖紙索引重建）
+│   └── scheduler.js          # node-cron 排程（9:00 AM 考勤 + 12:00 PM 圖紙索引重建）
 ├── modules/
 │   └── commands.js           # 所有命令的登記與處理函數
 skills/
@@ -307,13 +307,13 @@ MonitorServer（`src/core/monitorServer.js`）提供三個 HTTP endpoint：
 | 時間    | 頻率     | 任務                                     |
 | ------- | -------- | ---------------------------------------- |
 | 9:00 AM | 週一至六 | 考勤申報（向已登記判頭發送私訊收集人數） |
-| 3:00 AM | 每日     | 重建圖紙索引（掃描 `paths.por` 目錄）    |
+| 12:00 PM | 每日     | 重建圖紙索引（掃描 `paths.por` 目錄）    |
 
 時區固定為 `Asia/Hong_Kong`。
 
 ### 圖紙搜尋 (Drawing Search)
 
-`skills/drawingSearch.js` 使用**SQLite 預建索引策略**：啟動時掃描 `config.paths.por` 目錄，將索引存入 `pbots.db` 嘅 `files` 表，後續查詢只讀 SQLite 不掃描檔案系統。索引支援物料碼前綴分類（FST=鐵料、FAC=鋁板、BGL=玻璃、ACD=鋁板、HGRH=鋁型材 等 16 類），並提供**空格分隔多條件 AND 搜尋**（物料碼 + 通用碼 + 關鍵字可混搭）。支援「格式選擇」步驟：可揀 PDF、DWG、或兩者一併下載。凌晨 3:00 自動重建，管理員可手動 `#searchpor`。
+`skills/drawingSearch.js` 使用**SQLite 預建索引策略**：啟動時掃描 `config.paths.por` 目錄，將索引存入 `pbots.db` 嘅 `files` 表，後續查詢只讀 SQLite 不掃描檔案系統。索引支援物料碼前綴分類（FST=鐵料、FAC=鋁板、BGL=玻璃、ACD=鋁板、HGRH=鋁型材 等 16 類），並提供**空格分隔多條件 AND 搜尋**（物料碼 + 通用碼 + 關鍵字可混搭）。支援「格式選擇」步驟：可揀 PDF、DWG、或兩者一併下載。中午 12:00 自動重建，管理員可手動 `#searchpor`。
 
 **多步驟互動狀態機（#Drawing）：**
 
@@ -323,7 +323,7 @@ input ──→ [結果>20?] ──→ filter_material ──→ [系統碼>1?] 
   └───→ [≤20 或跳過篩選] ←──────────────────────────────────────────────┘
                           │
                           ↓
-                    format_select (PDF/DWG/両方)
+                    format_select (PDF/DWG/兩方)
                           │
                           ↓
                      ask_dwg (有同名 DWG? y/n)

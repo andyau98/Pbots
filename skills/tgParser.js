@@ -109,11 +109,15 @@ async function extractTextFromPdf(filePath) {
     const doc = await pdfjs.getDocument({ data: uint8 }).promise;
     let fullText = '';
 
-    for (let i = 1; i <= doc.numPages; i++) {
-        const page = await doc.getPage(i);
-        const content = await page.getTextContent();
-        const pageText = content.items.map((item) => item.str).join(' ');
-        fullText += pageText + '\n';
+    try {
+        for (let i = 1; i <= doc.numPages; i++) {
+            const page = await doc.getPage(i);
+            const content = await page.getTextContent();
+            const pageText = content.items.map((item) => item.str).join(' ');
+            fullText += pageText + '\n';
+        }
+    } finally {
+        await doc.destroy();
     }
 
     return fullText;
@@ -143,37 +147,43 @@ async function ocrTgPdf(filePath) {
         const mupdf = await import('mupdf');
         const dataBuffer = fs.readFileSync(filePath);
         const doc = mupdf.PDFDocument.openDocument(dataBuffer, 'application/pdf');
-        const page = doc.loadPage(0);
+        const numPages = doc.numPages || 1;
 
         const Tesseract = require('tesseract.js');
         let allNumbers = [...(cached?.drawingNumbers || [])];
         let bestText = cached?.ocrText || '';
         let achievedScale = 0;
 
-        for (const scale of SCALES) {
-            if (cached && cached.ocrScale === scale && cached.drawingNumbers) {
-                const merged = new Set([...allNumbers, ...cached.drawingNumbers]);
-                allNumbers = [...merged];
-                if (cached.ocrText && cached.ocrText.length > bestText.length) {
-                    bestText = cached.ocrText;
+        for (let p = 0; p < numPages; p++) {
+            const page = doc.loadPage(p);
+
+            for (const scale of SCALES) {
+                if (cached && cached.ocrScale === scale && cached.drawingNumbers) {
+                    const merged = new Set([...allNumbers, ...cached.drawingNumbers]);
+                    allNumbers = [...merged];
+                    if (cached.ocrText && cached.ocrText.length > bestText.length) {
+                        bestText = cached.ocrText;
+                    }
+                    achievedScale = scale;
+                    continue;
                 }
+
+                const matrix = mupdf.Matrix.scale(scale, scale);
+                const pixmap = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, false);
+                const pngData = pixmap.asPNG();
+
+                const { data: { text } } = await Tesseract.recognize(pngData, 'eng');
+                const numbers = extractDrawingNumbers(text);
+                const merged = new Set([...allNumbers, ...numbers]);
+                allNumbers = [...merged];
+                if (text.length > bestText.length) bestText = text;
                 achievedScale = scale;
-                continue;
+
+                console.log(`  👁️ OCR scale ${scale} page ${p + 1}: ${path.basename(filePath)} → ${numbers.length} 個（累計 ${allNumbers.length} 個）`);
             }
-
-            const matrix = mupdf.Matrix.scale(scale, scale);
-            const pixmap = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, false);
-            const pngData = pixmap.asPNG();
-
-            const { data: { text } } = await Tesseract.recognize(pngData, 'eng');
-            const numbers = extractDrawingNumbers(text);
-            const merged = new Set([...allNumbers, ...numbers]);
-            allNumbers = [...merged];
-            if (text.length > bestText.length) bestText = text;
-            achievedScale = scale;
-
-            console.log(`  👁️ OCR scale ${scale}: ${path.basename(filePath)} → ${numbers.length} 個（累計 ${allNumbers.length} 個）`);
         }
+
+        doc.destroy();
 
         const stat = fs.statSync(filePath);
         const latestCache = dataStore.get(TG_CACHE_KEY, {});
@@ -216,7 +226,8 @@ async function extractTgContent(filePath, useOcr = false) {
     const fileName = path.basename(filePath);
 
     const cache = dataStore.get(TG_CACHE_KEY, {});
-    const stat = fs.statSync(filePath);
+    let stat;
+    try { stat = fs.statSync(filePath); } catch { return { text: '', drawingNumbers: [], sourceMethod: 'error', error: 'file_not_found' }; }
     const cached = cache[filePath];
     if (cached && cached.mtime === stat.mtimeMs && cached.extractedAt && !cached.error) {
         return {
@@ -230,7 +241,8 @@ async function extractTgContent(filePath, useOcr = false) {
     let result;
 
     if (ext === '.dxf') {
-        const text = extractTextFromDxf(filePath);
+        let text;
+        try { text = extractTextFromDxf(filePath); } catch (dxfErr) { text = ''; }
         const numbers = extractDrawingNumbers(text);
         result = {
             text: text.substring(0, 10000),
@@ -454,7 +466,8 @@ function scanAllFiles(porBasePath, maxDepth = 1) {
  * @returns {Promise<object>}
  */
 async function processFolder(folderPath, fileRegistry = null, useOcr = false) {
-    const files = fs.readdirSync(folderPath);
+    let files;
+    try { files = fs.readdirSync(folderPath); } catch { return { folder: path.basename(folderPath), files: 0, errors: 1, error: '讀取目錄失敗' }; }
     const tgEntries = [];
     const folderName = path.basename(folderPath);
 

@@ -30,7 +30,7 @@ input (用戶輸入關鍵字)
                             ↓
                      select (揀 PDF 圖紙，數字選擇)
                             │
-                     [有同名 DWG?] ──→ select_format (揀 PDF/DWG/両方)
+                     [有同名 DWG?] ──→ select_format (揀 PDF/DWG/兩方)
                             │                 │
                      [冇 DWG] ←─────────────────┘
                             │

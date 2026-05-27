@@ -33,18 +33,28 @@ class DataStore {
         console.log('🗄️  DataStore 已初始化');
     }
 
-    // ========== 通用 JSON 讀寫 ==========
+    // ========== 通用 JSON 讀寫（含記憶體快取） ==========
 
     /**
-     * 從 store 讀取 JSON 資料
+     * 從 store 讀取 JSON 資料（有 2 秒記憶體快取）
      * @param {string} filename - 不含路徑（例如 'admins.json'）
      * @param {*} defaultValue - 檔案不存在時的預設值
      */
     _read(filename, defaultValue = null) {
         const filePath = path.join(this._storeDir, filename);
+        const now = Date.now();
+
+        // 快取命中 + 未過期（2秒）
+        const cached = this._cache.get(filename);
+        if (cached && (now - cached.ts) < 2000) {
+            return cached.data;
+        }
+
         try {
             if (fs.existsSync(filePath)) {
-                return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                this._cache.set(filename, { data, ts: now });
+                return data;
             }
         } catch (error) {
             console.error(
@@ -52,16 +62,19 @@ class DataStore {
                 error.message
             );
         }
+        // 讀取失敗但快取有舊數據 → 用舊數據
+        if (cached) return cached.data;
         return defaultValue;
     }
 
     /**
-     * 寫入 JSON 資料到 store
+     * 寫入 JSON 資料到 store（同時更新快取）
      */
     _write(filename, data) {
         const filePath = path.join(this._storeDir, filename);
         try {
             fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+            this._cache.set(filename, { data, ts: Date.now() });
             return true;
         } catch (error) {
             console.error(
@@ -174,20 +187,23 @@ class DataStore {
 
     /**
      * 寫入任意鍵值（到 app.json）
+     * 只讀一次 app.json，唔再 double read
      */
     set(key, value) {
-        const appData = this._read('app.json', {});
+        const filename = 'app.json';
+        const appData = this._read(filename, {});
         appData[key] = value;
-        return this._write('app.json', appData);
+        return this._write(filename, appData);
     }
 
     /**
      * 刪除鍵值
      */
     delete(key) {
-        const appData = this._read('app.json', {});
+        const filename = 'app.json';
+        const appData = this._read(filename, {});
         delete appData[key];
-        return this._write('app.json', appData);
+        return this._write(filename, appData);
     }
 
     // ========== 統一輸出 ==========
@@ -199,7 +215,11 @@ class DataStore {
      * @returns {string} 完整檔案路徑
      */
     exportFile(filename, content) {
-        const filePath = path.join(this._exportDir, filename);
+        const filePath = path.join(this._exportDir, path.normalize(filename));
+        // 路徑穿越防護：確保最終路徑仍然喺 export 目錄內
+        if (!filePath.startsWith(this._exportDir)) {
+            throw new Error('無效嘅匯出路徑');
+        }
         fs.writeFileSync(filePath, content);
         console.log(`📤 DataStore 匯出: ${filePath}`);
         return filePath;

@@ -16,6 +16,7 @@ const AuthManager = require('./core/authManager');
 const CommandRouter = require('./core/commandRouter');
 const { sessionManager } = require('./core/sessionManager');
 const { dataStore } = require('./core/dataStore');
+const { getDatabase } = require('./core/database');
 const MonitorServer = require('./core/monitorServer');
 const Scheduler = require('./core/scheduler');
 const { dailyAttendanceTask } = require('../skills/workerAttendance');
@@ -91,13 +92,22 @@ monitorServer.start(services);
 const commandRouter = new CommandRouter(authManager, config);
 registerAll(commandRouter);
 
+// ── 排程器實例（防止重新連線時重複建立） ──
+let _scheduler = null;
+
 // ── 初始化 WhatsApp 客戶端 ──
 const client = new Client({
     authStrategy: new LocalAuth({ clientId: 'pbots-client' }),
     puppeteer: {
         headless: true,
         executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'],
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-gpu',
+            // 更新 user agent 以相容新版 WhatsApp Web
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+        ],
     },
 });
 
@@ -153,9 +163,14 @@ client.on('ready', async () => {
     // 切換監控伺服器為儀表板模式
     monitorServer.setReady(true);
 
-    // 啟動排程模組（每日 9:00 AM 考勤申報）
-    const scheduler = new Scheduler();
-    scheduler.start(client, dailyAttendanceTask, config);
+    // 啟動排程模組（防止重新連線時重複建立）
+    try {
+        if (_scheduler) _scheduler.stop();
+        _scheduler = new Scheduler();
+        _scheduler.start(client, dailyAttendanceTask, config);
+    } catch (schedErr) {
+        console.error('❌ 排程器啟動失敗:', schedErr.message);
+    }
 
     try {
         await healthMonitor.initialize();
@@ -250,8 +265,10 @@ client.on('message', async (message) => {
             groupId: isGroup ? message.from : null,
         };
 
-        // 記錄訊息
-        await messageLogger.logMessage(message, context);
+        // 記錄訊息（失敗唔影響命令路由）
+        try { await messageLogger.logMessage(message, context); } catch (logErr) {
+            console.warn('⚠️ 記錄訊息失敗:', logErr.message);
+        }
 
         // ── 優先級 1：SessionManager 群組鎖定攔截 ──
         // Phase 7：如果群組已被其他用戶鎖定（有進行中的互動會話），
@@ -287,19 +304,25 @@ client.on('message', async (message) => {
             }
         }
 
-        // ── 優先級 3：自動媒體下載 ──
+        // ── 優先級 3：自動媒體下載（失敗唔影響命令路由） ──
         if (message.hasMedia) {
-            const mediaResult = await mediaDownloader.downloadMedia(
-                message,
-                senderInfo.pushname
-            );
-            if (mediaResult) {
-                await messageLogger.logMessage(message, {
-                    ...context,
-                    mediaPath: mediaResult.filePath,
-                    mediaType: mediaResult.mediaType,
-                    fileSize: mediaResult.fileSize,
-                });
+            try {
+                const mediaResult = await mediaDownloader.downloadMedia(
+                    message,
+                    senderInfo.pushname
+                );
+                if (mediaResult) {
+                    try {
+                        await messageLogger.logMessage(message, {
+                            ...context,
+                            mediaPath: mediaResult.filePath,
+                            mediaType: mediaResult.mediaType,
+                            fileSize: mediaResult.fileSize,
+                        });
+                    } catch (mlErr) { /* 記錄媒體日誌失敗唔影響流程 */ }
+                }
+            } catch (dlErr) {
+                console.warn('⚠️ 媒體下載失敗:', dlErr.message);
             }
         }
 
@@ -383,20 +406,30 @@ client.initialize().catch((error) => {
 });
 
 // ── 優雅關閉 ──
-process.on('SIGINT', async () => {
-    console.log('\n🛑 收到關閉信號，正在關閉機器人...');
+async function gracefulShutdown(signal) {
+    console.log(`\n🛑 收到 ${signal}，正在關閉機器人...`);
 
-    monitorServer.stop();
-    healthMonitor.stop();
-    messageLogger.cleanupOldLogs(30);
-    authManager.cleanupOldRecords(30);
-    mediaDownloader.cleanupOldMedia(30);
-    healthMonitor.cleanupOldErrors(30);
-    errorRecovery.cleanupOldErrors(30);
+    try { if (_scheduler) _scheduler.stop(); } catch (e) { /* ignore */ }
+    try { monitorServer.stop(); } catch (e) { /* ignore */ }
+    try { healthMonitor.stop(); } catch (e) { /* ignore */ }
+    try { messageLogger.cleanupOldLogs(30); } catch (e) { /* ignore */ }
+    try { authManager.cleanupOldRecords(30); } catch (e) { /* ignore */ }
+    try { mediaDownloader.cleanupOldMedia(30); } catch (e) { /* ignore */ }
+    try { healthMonitor.cleanupOldErrors(30); } catch (e) { /* ignore */ }
+    try { errorRecovery.cleanupOldErrors(30); } catch (e) { /* ignore */ }
+    try { getDatabase().close(); } catch (e) { /* ignore */ }
 
-    await client.destroy();
+    try {
+        await client.destroy();
+    } catch (destroyErr) {
+        console.warn('⚠️ 關閉客戶端時出錯:', destroyErr.message);
+    }
+
     console.log('👋 PBOTS 機器人已關閉');
     process.exit(0);
-});
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 module.exports = { client, messageLogger };

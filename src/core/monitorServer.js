@@ -664,7 +664,7 @@ function buildDeepscanPage() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>PBOTS Deep Scan 進度</title>
+<title>PBOTS TG 位置圖掃描進度</title>
 <style>
 :root{--bg:#0a0f1a;--srf:#111827;--srf2:#161f30;--bd:#1e293b;--tx:#e2e8f0;--t2:#94a3b8;--t3:#64748b;--ac:#38bdf8;--gn:#22c55e;--rd:#ef4444;--am:#f59e0b}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -699,8 +699,8 @@ h1{font-size:1.2rem;color:var(--ac);margin-bottom:8px;text-align:center}
 </head>
 <body>
 <div class="container">
-  <h1>🔍 TG Deep Scan</h1>
-  <div class="sub">位置圖 DWG 預建索引進度</div>
+  <h1>🔍 TG 位置圖掃描</h1>
+  <div class="sub">完整重建位置圖映射索引進度</div>
 
   <div class="progress-wrap">
     <div class="progress-label">

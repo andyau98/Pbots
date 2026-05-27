@@ -88,10 +88,22 @@ async function findTodayCell() {
         // 複製上一個 sheet 作為模板
         const lastWs = wb.worksheets[wb.worksheets.length - 1];
         ws = wb.addWorksheet(monthStr);
-        // 複製結構
+        // 複製欄寬
+        if (lastWs.columns) {
+            ws.columns = lastWs.columns.map(col => ({ ...col, header: undefined }));
+        }
+        // 複製合併儲存格
+        if (lastWs.model.merges) {
+            for (const merge of lastWs.model.merges) {
+                ws.mergeCells(merge);
+            }
+        }
+        // 複製結構（值 + 樣式）
         lastWs.eachRow({ includeEmpty: true }, (row, rowNum) => {
             row.eachCell({ includeEmpty: true }, (cell, colNum) => {
-                ws.getCell(rowNum, colNum).value = cell.value;
+                const newCell = ws.getCell(rowNum, colNum);
+                newCell.value = cell.value;
+                if (cell.style) newCell.style = { ...cell.style };
             });
         });
     }
@@ -148,11 +160,17 @@ async function findTodayCell() {
         !existingDate ||
         (typeof existingDate === 'number' && existingDate < 1)
     ) {
+        // 用 Asia/Hong_Kong 時區計算日期
+        const hkNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Hong_Kong' }));
+        // Excel 日期序列：1899-12-30 係第 0 日
+        const excelEpoch = new Date(Date.UTC(1899, 11, 30));
         const todaySerial = Math.floor(
-            (now.getTime() - new Date(1899, 11, 30).getTime()) / 86400000
+            (Date.UTC(hkNow.getFullYear(), hkNow.getMonth(), hkNow.getDate()) - excelEpoch.getTime()) / 86400000
         );
-        ws.getCell(dataRowNum, dateCol).value = todaySerial;
-        ws.getCell(dataRowNum, weekCol).value = weekNames[now.getDay()];
+        // Lotus 123 閏年修正：Excel 錯誤地將 1900-02-29 當作有效日期
+        const excelSerial = todaySerial + (todaySerial >= 61 ? 2 : 1);
+        ws.getCell(dataRowNum, dateCol).value = excelSerial;
+        ws.getCell(dataRowNum, weekCol).value = weekNames[hkNow.getDay()];
     }
 
     return {
