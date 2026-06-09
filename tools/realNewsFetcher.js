@@ -176,15 +176,24 @@ class RealNewsFetcher {
                 month: '2-digit',
                 day: '2-digit',
             });
+            
+            // 縮短 URL 顯示 - 只提取網域名稱
+            let displayUrl = '';
+            if (article.url) {
+                try {
+                    const urlObj = new URL(article.url);
+                    displayUrl = urlObj.hostname.replace('www.', '');
+                } catch {
+                    displayUrl = article.url.substring(0, 40) + '...';
+                }
+            }
+            
             report += '━━━━━━━━━━━━━━━━\n';
             report += `${index + 1}. *${article.title}*\n`;
-            report += `📅 ${dateStr}  |  📢 ${article.source || '新聞來源'}\n`;
+            report += `📅 ${dateStr}  |  📢 ${article.source || displayUrl}\n`;
 
             if (article.description && article.description.length > 10) {
                 report += `📝 ${article.description}\n`;
-            }
-            if (article.url) {
-                report += `🔗 ${article.url}\n`;
             }
             report += '\n';
         });
