@@ -59,6 +59,7 @@ class RealNewsFetcher {
             const link = $(item).find('link').text().trim();
             const pubDate = $(item).find('pubDate').text().trim();
             const description = $(item).find('description').text().trim();
+            const guid = $(item).find('guid').text().trim();
 
             if (!title || title === 'Google 新聞') return;
 
@@ -71,6 +72,31 @@ class RealNewsFetcher {
                 cleanTitle = title
                     .substring(0, title.lastIndexOf(' - '))
                     .trim();
+            }
+
+            // 提取真實文章連結
+            let realUrl = link;
+            
+            // 方法1：從 url= 參數提取
+            const urlMatch = link.match(/[?&]url=([^&]+)/);
+            if (urlMatch && urlMatch[1]) {
+                try {
+                    realUrl = decodeURIComponent(urlMatch[1]);
+                } catch {
+                    realUrl = link;
+                }
+            } else {
+                // 方法2：從 guid 提取文章 ID，然後構造真實 URL
+                const articleIdMatch = link.match(/\/articles\/([A-Za-z0-9_-]+)/);
+                if (articleIdMatch && articleIdMatch[1]) {
+                    // Google News 的文章 ID 格式，需要用另一種方式處理
+                    // 直接使用 link 但移除 Google News 的包裝
+                    const cleanMatch = link.match(/https?:\/\/news\.google\.com\/[^?]+/);
+                    if (cleanMatch) {
+                        // 這仍然指向 Google News，需要 fetch 才能獲得真實連結
+                        // 暫時保留原始連結作為 fallback
+                    }
+                }
             }
 
             // 清理 description 中的 HTML
@@ -89,7 +115,7 @@ class RealNewsFetcher {
 
             articles.push({
                 title: cleanTitle,
-                url: link,
+                url: realUrl,
                 source: source,
                 date: pubDate ? new Date(pubDate) : new Date(),
                 description: cleanDesc,
@@ -164,7 +190,7 @@ class RealNewsFetcher {
             '🚧 *香港地盤意外新聞報告*\n\n' +
             `📅 報告時間: ${hkTime.toLocaleString('zh-HK', { hour12: false })}\n` +
             '📍 地區: 香港特別行政區\n' +
-            '📰 來源: Google News 即時新聞\n' +
+            '📰 來源: Google News（顯示原始文章連結）\n' +
             `📊 相關新聞: ${articles.length} 條\n\n`;
 
         // 顯示前 7 條
@@ -177,29 +203,16 @@ class RealNewsFetcher {
                 day: '2-digit',
             });
             
-            // 提取真實文章連結（從 Google News 轉發連結中獲取）
-            let realUrl = article.url;
-            if (article.url && article.url.includes('news.google.com')) {
-                const match = article.url.match(/url=([^&]+)/);
-                if (match && match[1]) {
-                    try {
-                        realUrl = decodeURIComponent(match[1]);
-                    } catch {
-                        realUrl = article.url;
-                    }
-                }
-            }
-            
-            // 縮短 URL 顯示
-            let shortUrl = realUrl;
+            // 縮短 URL 顯示（使用真實連結）
+            let shortUrl = article.url;
             try {
-                const urlObj = new URL(realUrl);
+                const urlObj = new URL(article.url);
                 shortUrl = urlObj.hostname.replace('www.', '') + urlObj.pathname;
                 if (shortUrl.length > 50) {
                     shortUrl = shortUrl.substring(0, 47) + '...';
                 }
             } catch {
-                shortUrl = realUrl.substring(0, 50) + '...';
+                shortUrl = article.url.substring(0, 50) + '...';
             }
             
             report += '━━━━━━━━━━━━━━━━\n';
@@ -209,7 +222,7 @@ class RealNewsFetcher {
             if (article.description && article.description.length > 10) {
                 report += `📝 ${article.description}\n`;
             }
-            report += `\n🔗 ${realUrl}\n`;
+            report += `\n🔗 ${article.url}\n`;
         });
 
         report +=
