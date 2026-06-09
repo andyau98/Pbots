@@ -177,25 +177,39 @@ class RealNewsFetcher {
                 day: '2-digit',
             });
             
-            // 縮短 URL 顯示 - 只提取網域名稱
-            let displayUrl = '';
-            if (article.url) {
-                try {
-                    const urlObj = new URL(article.url);
-                    displayUrl = urlObj.hostname.replace('www.', '');
-                } catch {
-                    displayUrl = article.url.substring(0, 40) + '...';
+            // 提取真實文章連結（從 Google News 轉發連結中獲取）
+            let realUrl = article.url;
+            if (article.url && article.url.includes('news.google.com')) {
+                const match = article.url.match(/url=([^&]+)/);
+                if (match && match[1]) {
+                    try {
+                        realUrl = decodeURIComponent(match[1]);
+                    } catch {
+                        realUrl = article.url;
+                    }
                 }
+            }
+            
+            // 縮短 URL 顯示
+            let shortUrl = realUrl;
+            try {
+                const urlObj = new URL(realUrl);
+                shortUrl = urlObj.hostname.replace('www.', '') + urlObj.pathname;
+                if (shortUrl.length > 50) {
+                    shortUrl = shortUrl.substring(0, 47) + '...';
+                }
+            } catch {
+                shortUrl = realUrl.substring(0, 50) + '...';
             }
             
             report += '━━━━━━━━━━━━━━━━\n';
             report += `${index + 1}. *${article.title}*\n`;
-            report += `📅 ${dateStr}  |  📢 ${article.source || displayUrl}\n`;
+            report += `📅 ${dateStr}  |  📢 ${article.source || shortUrl}\n`;
 
             if (article.description && article.description.length > 10) {
                 report += `📝 ${article.description}\n`;
             }
-            report += '\n';
+            report += `\n🔗 ${realUrl}\n`;
         });
 
         report +=
