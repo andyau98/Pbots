@@ -7,6 +7,7 @@ class RealNewsFetcher {
         this.userAgent =
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
         console.log('📰 真實新聞抓取工具已初始化（Google News RSS + cheerio）');
+        this.urlCache = new Map(); // 緩存已解析的 URL
     }
 
     /**
@@ -27,6 +28,58 @@ class RealNewsFetcher {
     }
 
     /**
+     * 從 Google News 文章頁面提取真實文章 URL
+     */
+    async extractRealUrl(googleNewsUrl) {
+        // 檢查緩存
+        if (this.urlCache.has(googleNewsUrl)) {
+            return this.urlCache.get(googleNewsUrl);
+        }
+        
+        try {
+            // 嘗試直接提取 URL 參數
+            const urlMatch = googleNewsUrl.match(/[?&]url=([^&]+)/);
+            if (urlMatch && urlMatch[1]) {
+                try {
+                    const realUrl = decodeURIComponent(urlMatch[1]);
+                    this.urlCache.set(googleNewsUrl, realUrl);
+                    return realUrl;
+                } catch {}
+            }
+            
+            // 嘗試 fetch HTML 並提取 og:url
+            const html = await this.fetchUrl(googleNewsUrl);
+            if (html) {
+                const $ = cheerio.load(html);
+                
+                // 嘗試多種方式提取真實 URL
+                const ogUrl = $('meta[property="og:url"]').attr('content');
+                if (ogUrl && !ogUrl.includes('news.google.com')) {
+                    this.urlCache.set(googleNewsUrl, ogUrl);
+                    return ogUrl;
+                }
+                
+                const canonical = $('link[rel="canonical"]').attr('href');
+                if (canonical && !canonical.includes('news.google.com')) {
+                    this.urlCache.set(googleNewsUrl, canonical);
+                    return canonical;
+                }
+                
+                // 嘗試搵 anylink
+                const anyLink = $('a.anylink, a[rel="noopener"]').first().attr('href');
+                if (anyLink && anyLink.startsWith('http') && !anyLink.includes('news.google.com')) {
+                    this.urlCache.set(googleNewsUrl, anyLink);
+                    return anyLink;
+                }
+            }
+        } catch {}
+        
+        // 如果都提取唔到，返回原始 URL
+        this.urlCache.set(googleNewsUrl, googleNewsUrl);
+        return googleNewsUrl;
+    }
+
+    /**
      * 從 Google News RSS 搜索新聞
      */
     async searchGoogleNews(query) {
@@ -37,7 +90,24 @@ class RealNewsFetcher {
 
             if (!xml) return [];
 
-            return this.parseGoogleNewsRss(xml);
+            const articles = this.parseGoogleNewsRss(xml);
+            
+            // 提取真實 URL（非同步，不阻塞）
+            const articleCount = articles.length;
+            console.log(`   📰 找到 ${articleCount} 篇文章，正在提取真實連結...`);
+            
+            // 使用 Promise.all 並行提取，但限制並發數量避免被封
+            const realUrlPromises = articles.map((article, index) => {
+                return this.extractRealUrl(article.url).then(realUrl => {
+                    article.url = realUrl;
+                    if ((index + 1) % 5 === 0) {
+                        console.log(`   ⏳ 已處理 ${index + 1}/${articleCount} 篇`);
+                    }
+                    return article;
+                });
+            });
+            
+            return Promise.all(realUrlPromises);
         } catch (error) {
             console.error(
                 `   ❌ Google News 搜索失敗 (${query}):`,
@@ -59,7 +129,6 @@ class RealNewsFetcher {
             const link = $(item).find('link').text().trim();
             const pubDate = $(item).find('pubDate').text().trim();
             const description = $(item).find('description').text().trim();
-            const guid = $(item).find('guid').text().trim();
 
             if (!title || title === 'Google 新聞') return;
 
@@ -72,31 +141,6 @@ class RealNewsFetcher {
                 cleanTitle = title
                     .substring(0, title.lastIndexOf(' - '))
                     .trim();
-            }
-
-            // 提取真實文章連結
-            let realUrl = link;
-            
-            // 方法1：從 url= 參數提取
-            const urlMatch = link.match(/[?&]url=([^&]+)/);
-            if (urlMatch && urlMatch[1]) {
-                try {
-                    realUrl = decodeURIComponent(urlMatch[1]);
-                } catch {
-                    realUrl = link;
-                }
-            } else {
-                // 方法2：從 guid 提取文章 ID，然後構造真實 URL
-                const articleIdMatch = link.match(/\/articles\/([A-Za-z0-9_-]+)/);
-                if (articleIdMatch && articleIdMatch[1]) {
-                    // Google News 的文章 ID 格式，需要用另一種方式處理
-                    // 直接使用 link 但移除 Google News 的包裝
-                    const cleanMatch = link.match(/https?:\/\/news\.google\.com\/[^?]+/);
-                    if (cleanMatch) {
-                        // 這仍然指向 Google News，需要 fetch 才能獲得真實連結
-                        // 暫時保留原始連結作為 fallback
-                    }
-                }
             }
 
             // 清理 description 中的 HTML
@@ -115,11 +159,11 @@ class RealNewsFetcher {
 
             articles.push({
                 title: cleanTitle,
-                url: realUrl,
+                url: link, // 原始 Google News 連結，稍後會被 extractRealUrl 替換
                 source: source,
                 date: pubDate ? new Date(pubDate) : new Date(),
                 description: cleanDesc,
-                isReal: true,
+                isReal: false,
             });
         });
 
