@@ -14,7 +14,7 @@
         "data": "./data/",
         "backups": "./backups/",
         "envelope": "./envelope/",
-        "por": "V:/POR/01 POR ISAAC"
+        "por": "Z:/POR/01 POR ISAAC"
     },
     "bot": {
         "name": "PBOTS",

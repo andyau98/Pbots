@@ -67,6 +67,11 @@ class AppDatabase {
             CREATE INDEX IF NOT EXISTS idx_tg_mapping_drawing_number ON tg_mapping(drawing_number);
             CREATE INDEX IF NOT EXISTS idx_tg_mapping_file_path ON tg_mapping(file_path);
         `);
+
+        // 兼容舊資料庫：如果未加 tg_file_sizes 欄位就補上
+        try {
+            this.db.exec("ALTER TABLE folder_cache ADD COLUMN tg_file_sizes TEXT NOT NULL DEFAULT '{}'");
+        } catch (_) { /* 欄位已存在就跳過 */ }
     }
 
     // ── File index ──
@@ -113,8 +118,8 @@ class AppDatabase {
     /** 寫入/更新 folder 預緩存 */
     setFolderCache(folder, data) {
         this.db.prepare(`
-            INSERT OR REPLACE INTO folder_cache (folder, drawing_numbers, drawing_files, tg_files, dwg_tg_files, pdf_tg_files, built_at, accessed_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT accessed_count FROM folder_cache WHERE folder = ?), 0) + 1)
+            INSERT OR REPLACE INTO folder_cache (folder, drawing_numbers, drawing_files, tg_files, dwg_tg_files, pdf_tg_files, tg_file_sizes, built_at, accessed_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT accessed_count FROM folder_cache WHERE folder = ?), 0) + 1)
         `).run(
             folder,
             data.drawing_numbers || '[]',
@@ -122,6 +127,7 @@ class AppDatabase {
             data.tg_files || '[]',
             data.dwg_tg_files || '[]',
             data.pdf_tg_files || '[]',
+            data.tg_file_sizes || '{}',
             new Date().toISOString(),
             folder
         );
@@ -220,6 +226,17 @@ class AppDatabase {
     /** 刪除特定檔案路徑嘅 TG 映射 */
     deleteTgMappingByFilePath(filePath) {
         this.db.prepare('DELETE FROM tg_mapping WHERE file_path = ?').run(filePath);
+    }
+
+    /** 刪除特定 folder 嘅所有 TG 映射（用 dwg_path 前綴匹配） */
+    clearTgMappingByFolder(folderPath) {
+        const pattern = folderPath.replace(/\\/g, '/');
+        this.db.prepare("DELETE FROM tg_mapping WHERE REPLACE(dwg_path, '\\', '/') LIKE ?").run(pattern + '%');
+    }
+
+    /** 取得所有 folder_cache 條目 */
+    getAllFolderCache() {
+        return this.db.prepare('SELECT * FROM folder_cache').all();
     }
 
     /** TG 映射統計 */

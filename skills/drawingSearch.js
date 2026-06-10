@@ -86,21 +86,9 @@ function scanDirectory(dirPath) {
                     const porMatch = fullPath.match(/POR[/\\][^/\\]+[/\\]([^/\\]+)/i);
                     const por = porMatch ? porMatch[1] : '';
 
-                    let hasTag = false;
-                    if (upperName.includes('_TG') || upperName.includes('-TG') || upperName.includes('TAG')) {
-                        hasTag = true;
-                    } else {
-                        try {
-                            const dirEntries = fs.readdirSync(dirPath);
-                            const base = path.basename(name, ext);
-                            const baseUpper = base.toUpperCase();
-                            hasTag = dirEntries.some(f =>
-                                f !== name &&
-                                (f.toUpperCase().includes('_TG') || f.toUpperCase().includes('-TG') || f.toUpperCase().includes('TAG')) &&
-                                (f.toUpperCase().includes(baseUpper) || baseUpper.includes(f.replace(/[-_]TG.*$/i, '').replace(/\.[^.]+$/, '').toUpperCase()))
-                            );
-                        } catch { /* ignore */ }
-                    }
+                    // hasTag = name 含有 -TG- / _TG_ / TAG，表示係位置圖檔案
+                    // 唔用 folder-level 推斷，避免誤標非位置圖檔案
+                    const hasTag = upperName.includes('_TG') || upperName.includes('-TG') || upperName.includes('TAG');
 
                     results.push({ name, path: fullPath, system, systems, por, materials, hasTag });
                 }
@@ -508,13 +496,55 @@ async function _rebuildTgMapping(porPath) {
     const allFiles = db.getAllFiles();
 
     // 過濾出 has_tag = 1 嘅 DWG 檔案
-    const dwgFiles = allFiles.filter(f => f.has_tag && f.ext === '.dwg');
+    // 用檔名判斷係咪位置圖，唔靠 has_tag（避免 database 舊數據標錯）
+    const dwgFiles = allFiles.filter(f => {
+        const name = (f.name || '').toUpperCase();
+        return (name.includes('-TG-') || name.includes('_TG_') || name.includes('TAG')) && f.ext === '.dwg';
+    });
     if (dwgFiles.length === 0) {
         console.log('  ⚠️ 沒有需要掃描嘅 DWG 位置圖');
         return { dwgCount: 0, totalMappings: 0, scannedCount: 0, cachedCount: 0 };
     }
 
-    console.log(`  📄 ${dwgFiles.length} 個 DWG 位置圖需要掃描`);
+    // 按 folder 分組
+    const byFolder = {};
+    for (const f of dwgFiles) {
+        const folder = f.folder || path.dirname(f.path);
+        if (!byFolder[folder]) byFolder[folder] = { files: [], sizes: {} };
+        byFolder[folder].files.push(f);
+        try {
+            const stat = fs.statSync(f.path);
+            byFolder[folder].sizes[f.name] = stat.size;
+        } catch {
+            byFolder[folder].sizes[f.name] = -1;
+        }
+    }
+    console.log(`  📂 ${Object.keys(byFolder).length} 個 folder 有位置圖，共 ${dwgFiles.length} 個檔案`);
+
+    // 比對每個 folder 嘅 TG file sizes，決定邊啲 folder 需要重新掃描
+    const foldersToScan = [];
+    const skippedFolders = [];
+    for (const [folder, info] of Object.entries(byFolder)) {
+        const cached = db.getFolderCache(folder);
+        const storedSizes = cached ? JSON.parse(cached.tg_file_sizes || '{}') : {};
+        const curStr = JSON.stringify(Object.entries(info.sizes).sort());
+        const oldStr = JSON.stringify(Object.entries(storedSizes).sort());
+        if (curStr === oldStr) {
+            skippedFolders.push(folder);
+        } else {
+            foldersToScan.push({ folder, files: info.files, sizes: info.sizes });
+        }
+    }
+
+    if (skippedFolders.length > 0) {
+        console.log(`  ⏭️ ${skippedFolders.length} 個 folder 嘅 TG 檔案無變更，跳過`);
+    }
+    if (foldersToScan.length === 0) {
+        console.log('  ✅ 所有 folder 都無變更，唔需要重新掃描');
+        _deepscanProgress.running = false;
+        return { dwgCount: dwgFiles.length, totalMappings: 0, scannedCount: 0, cachedCount: 0, skipped: skippedFolders.length };
+    }
+    console.log(`  🔄 ${foldersToScan.length} 個 folder 需要重新掃描`);
 
     // 初始化進度追蹤
     _deepscanProgress.running = true;
@@ -529,106 +559,115 @@ async function _rebuildTgMapping(porPath) {
     _deepscanProgress.phase = '掃描 DWG...';
     _deepscanProgress.startTime = new Date().toISOString();
 
-    const BATCH_SIZE = 50;       // 每 50 個檔案 batch save
-    const KEEP_PATHS = new Set(); // 追蹤有效路徑（俾 tg_cache cleanup 用）
+    const BATCH_SIZE = 50;
+    const KEEP_PATHS = new Set();
     let scannedCount = 0;
     let cachedCount = 0;
     let errorCount = 0;
     let batchAccum = 0;
 
-    // 清空舊 mapping（用 transaction 保護，確保全有或全無）
-    const tx = db.db.transaction(() => {
-        db.clearTgMapping();
-    });
-    try { tx(); } catch (e) {
-        console.error('  ❌ 清空舊 tg_mapping 失敗:', e.message);
-        _deepscanProgress.running = false;
-        return { dwgCount: 0, totalMappings: 0, scannedCount: 0, cachedCount: 0, errorCount: 1 };
-    }
-
     try {
-        for (const f of dwgFiles) {
-            _deepscanProgress.current++;
-            _deepscanProgress.currentFile = f.name;
-            try {
-                const stat = fs.statSync(f.path);
-                const cached = db.getTgCache(f.path);
+        for (const { folder, files, sizes } of foldersToScan) {
+            // 刪除呢個 folder 嘅舊 tg_mapping entries
+            db.clearTgMappingByFolder(folder);
 
-                // mtime 快取檢查（避免重複掃描未改動檔案）
-                const isFresh = cached &&
-                    cached.drawing_numbers &&
-                    cached.drawing_numbers !== '[]' &&
-                    Math.abs(Number(cached.mtime) - stat.mtimeMs) < 1;
+            for (const f of files) {
+                _deepscanProgress.current++;
+                _deepscanProgress.currentFile = f.name;
 
-                let numbers = [];
-                if (isFresh) {
-                    numbers = JSON.parse(cached.drawing_numbers);
-                    cachedCount++;
-                } else {
-                    const texts = await extractTextArrayFromDwg(f.path, 60000);
-                    const allText = texts.join(' ');
-                    numbers = extractDrawingNumbers(allText.toUpperCase());
+                try {
+                    const stat = fs.statSync(f.path);
+                    const cached = db.getTgCache(f.path);
 
-                    // 更新 tg_cache
-                    db.setTgCache(f.path, {
-                        drawing_numbers: JSON.stringify(numbers),
-                        source_method: 'dwg_direct',
-                        mtime: stat.mtimeMs,
-                    });
-                    scannedCount++;
-                    _deepscanProgress.scannedCount = scannedCount;
-                }
+                    // mtime 快取檢查（避免重複掃描未改動檔案）
+                    const isFresh = cached &&
+                        cached.drawing_numbers &&
+                        cached.drawing_numbers !== '[]' &&
+                        Math.abs(Number(cached.mtime) - stat.mtimeMs) < 1;
 
-                if (numbers.length === 0) continue;
+                    let numbers = [];
+                    if (isFresh) {
+                        numbers = JSON.parse(cached.drawing_numbers);
+                        cachedCount++;
+                    } else {
+                        const texts = await extractTextArrayFromDwg(f.path, 60000);
+                        const allText = texts.join(' ');
+                        numbers = extractDrawingNumbers(allText.toUpperCase());
 
-                KEEP_PATHS.add(f.path);
+                        // 更新 tg_cache
+                        db.setTgCache(f.path, {
+                            drawing_numbers: JSON.stringify(numbers),
+                            source_method: 'dwg_direct',
+                            mtime: stat.mtimeMs,
+                        });
+                        scannedCount++;
+                        _deepscanProgress.scannedCount = scannedCount;
+                    }
 
-                // 為每個繪圖編號建立 mapping（DWG 路徑）
-                const now = new Date().toISOString();
-                const batchMappings = [];
-                for (const num of numbers) {
-                    batchMappings.push({
-                        drawing_number: num,
-                        file_path: f.path,
-                        dwg_path: f.path,
-                        updated_at: now,
-                    });
-                }
+                    if (numbers.length === 0) continue;
 
-                // 也為 companion PDF 建立 mapping（如有）
-                const pdfPath = f.path.replace(/\.dwg$/i, '.pdf').replace(/\.DWG$/, '.PDF');
-                if (fs.existsSync(pdfPath)) {
-                    KEEP_PATHS.add(pdfPath);
+                    KEEP_PATHS.add(f.path);
+
+                    // 為每個繪圖編號建立 mapping（DWG 路徑）
+                    const now = new Date().toISOString();
+                    const batchMappings = [];
                     for (const num of numbers) {
                         batchMappings.push({
                             drawing_number: num,
-                            file_path: pdfPath,
+                            file_path: f.path,
                             dwg_path: f.path,
                             updated_at: now,
                         });
                     }
+
+                    // 也為 companion PDF 建立 mapping（如有）
+                    const pdfPath = f.path.replace(/\.dwg$/i, '.pdf');
+                    if (fs.existsSync(pdfPath)) {
+                        KEEP_PATHS.add(pdfPath);
+                        for (const num of numbers) {
+                            batchMappings.push({
+                                drawing_number: num,
+                                file_path: pdfPath,
+                                dwg_path: f.path,
+                                updated_at: now,
+                            });
+                        }
+                    }
+
+                    // 逐批 insert
+                    db.insertTgMapping(batchMappings);
+                    batchAccum += batchMappings.length;
+                    _deepscanProgress.mappingCount += batchMappings.length;
+
+                } catch (err) {
+                    console.error(`  ❌ DWG 掃描失敗 (${f.name}):`, err.message);
+                    errorCount++;
+                    _deepscanProgress.errorCount = errorCount;
                 }
 
-                // 逐批 insert（避免一鑊過 280K+ 耗 memory）
-                db.insertTgMapping(batchMappings);
-                batchAccum += batchMappings.length;
-                _deepscanProgress.mappingCount += batchMappings.length;
-
-            } catch (err) {
-                console.error(`  ❌ DWG 掃描失敗 (${f.name}):`, err.message);
-                errorCount++;
-                _deepscanProgress.errorCount = errorCount;
+                // 每 BATCH_SIZE 個檔案清理一次 tg_cache
+                if (_deepscanProgress.current % BATCH_SIZE === 0) {
+                    try {
+                        db.cleanupTgCache([...KEEP_PATHS]);
+                    } catch { /* 非必要 */ }
+                    console.log(`  ... ${_deepscanProgress.current}/${_deepscanProgress.total} ` +
+                        `(${_deepscanProgress.mappingCount} mappings)`);
+                }
             }
 
-            // 每 BATCH_SIZE 個檔案清理一次 tg_cache，避免無限膨脹
-            if (_deepscanProgress.current % BATCH_SIZE === 0) {
-                try {
-                    db.cleanupTgCache([...KEEP_PATHS]);
-                } catch { /* 非必要 */ }
-                console.log(`  ... ${_deepscanProgress.current}/${_deepscanProgress.total} ` +
-                    `(${_deepscanProgress.mappingCount} mappings)`);
+            // 更新 folder_cache 嘅 tg_file_sizes
+            const folderCache = db.getFolderCache(folder);
+            if (folderCache) {
+                db.setFolderCache(folder, {
+                    drawing_numbers: folderCache.drawing_numbers,
+                    drawing_files: folderCache.drawing_files,
+                    tg_files: folderCache.tg_files,
+                    dwg_tg_files: folderCache.dwg_tg_files,
+                    pdf_tg_files: folderCache.pdf_tg_files,
+                    tg_file_sizes: JSON.stringify(sizes),
+                });
             }
-        } // close for loop
+        }
     } catch (outerErr) {
         console.error('  ❌ Deep Scan 未預期錯誤:', outerErr.message);
         errorCount++;
@@ -645,7 +684,7 @@ async function _rebuildTgMapping(porPath) {
 
     _deepscanProgress.running = false;
     _deepscanProgress.phase = '已完成';
-    return { dwgCount: dwgFiles.length, totalMappings: batchAccum, scannedCount, cachedCount, errorCount };
+    return { dwgCount: dwgFiles.length, totalMappings: batchAccum, scannedCount, cachedCount, errorCount, skipped: skippedFolders.length };
 }
 
 // ========== Folder 預緩存（加速位置圖搜尋） ==========
@@ -664,13 +703,14 @@ function _buildFolderCache(filePath) {
     // 已有快取
     const cached = db.getFolderCache(folder);
     if (cached) {
-        // 更新存取次數
+        // 更新存取次數，保留 tg_file_sizes
         db.setFolderCache(folder, {
             drawing_numbers: cached.drawing_numbers,
             drawing_files: cached.drawing_files,
             tg_files: cached.tg_files,
             dwg_tg_files: cached.dwg_tg_files,
             pdf_tg_files: cached.pdf_tg_files,
+            tg_file_sizes: cached.tg_file_sizes || '{}',
         });
         return JSON.parse(cached.drawing_numbers || '[]');
     }
@@ -681,6 +721,7 @@ function _buildFolderCache(filePath) {
     const tgFiles = [];
     const dwgTgFiles = [];
     const pdfTgFiles = [];
+    const tgFileSizes = {};
 
     try {
         const entries = fs.readdirSync(folder);
@@ -693,6 +734,7 @@ function _buildFolderCache(filePath) {
             const ext = path.extname(f).toLowerCase();
             if (/[-_](TG|TAG)/i.test(f)) {
                 tgFiles.push(fullPath);
+                tgFileSizes[f] = stat.size;
                 if (ext === '.dwg') dwgTgFiles.push(fullPath);
                 else if (ext === '.pdf') pdfTgFiles.push(fullPath);
             } else if (['.pdf', '.dwg', '.dxf'].includes(ext)) {
@@ -714,6 +756,7 @@ function _buildFolderCache(filePath) {
         tg_files: JSON.stringify(tgFiles),
         dwg_tg_files: JSON.stringify(dwgTgFiles),
         pdf_tg_files: JSON.stringify(pdfTgFiles),
+        tg_file_sizes: JSON.stringify(tgFileSizes),
     });
 
     console.log(`📁 Folder 快取: ${path.basename(folder)} → ${uniqueNumbers.length} 圖號, ${tgFiles.length} 位置圖`);
@@ -1175,20 +1218,50 @@ async function _scanAndShowRelevantTg(ctx) {
         }
     }
 
-    ctx.relevantTgFiles = relevant;
+    // 只保留 exact 匹配嘅位置圖（同 folder = 同項目，唔需要用前綴配對）
+    let exactOnly = relevant.filter(r => r.relevance === 'exact');
 
-    if (relevant.length === 0) {
-        // 無任何匹配 → 列出全部位置圖
-        ctx.relevantTgFiles = tagFiles.map(fp => ({
-            path: fp, name: path.basename(fp), relevance: 'available', matchedNumbers: [],
-        }));
-        ctx.onlySuggested = true;
-        const sel = _showRelevantTgSelection(ctx);
-        sel.question = '⚠️ 位置圖索引無匹配（請先執行 `#searchpor` 重建 TG 映射）。\n\n' + sel.question;
-        return sel;
+    // 智慧 fallback：index 搵唔到 → direct scan
+    if (exactOnly.length === 0) {
+        const scanResults = [];
+        for (const tgPath of tagFiles) {
+            const scan = await scanLayoutDwg(tgPath);
+            if (scan.error) continue;
+            const scanNums = (scan.numbers || []).map(n => n.replace(/[-_]/g, '').toUpperCase());
+            const matchedNums = (primaryNumbers || []).filter(n =>
+                scanNums.some(sn => sn.includes(n) || n.includes(sn))
+            );
+            if (matchedNums.length > 0) {
+                scanResults.push({
+                    path: tgPath,
+                    name: path.basename(tgPath),
+                    relevance: 'exact',
+                    matchedNumbers: matchedNums.slice(0, 15),
+                    sourceMethod: 'dwg_scan',
+                });
+            }
+        }
+        if (scanResults.length > 0) {
+            exactOnly = scanResults;
+        }
     }
 
-    ctx.onlySuggested = !hasExact;
+    // 最終 fallback：direct scan 都冇結果 → 顯示全部 TG
+    if (exactOnly.length === 0) {
+        const allFallback = tagFiles.map(tf => ({
+            path: tf,
+            name: path.basename(tf),
+            relevance: 'available',
+            matchedNumbers: [],
+            sourceMethod: 'fallback_all',
+        }));
+        ctx.relevantTgFiles = allFallback;
+        ctx.onlySuggested = false;
+        return _showRelevantTgSelection(ctx);
+    }
+
+    ctx.relevantTgFiles = exactOnly;
+    ctx.onlySuggested = false;
 
     return _showRelevantTgSelection(ctx);
 }
@@ -1198,26 +1271,25 @@ function _showRelevantTgSelection(ctx) {
     ctx.step = 'select_tg';
     const relevant = ctx.relevantTgFiles;
 
-    let question = '📍 *位置圖*';
-    if (ctx.onlySuggested) question += '\n⚠️ 以下位置圖無精確匹配';
-    question += '\n\n';
+    let question = '📍 *位置圖*\n\n';
+
+    // 顯示來源（index / direct scan / fallback all）
+    const source = relevant[0]?.sourceMethod;
+    if (source === 'dwg_scan') {
+        question += '⚡ 索引無匹配，已直接掃描 DWG 內容\n\n';
+    } else if (source === 'fallback_all') {
+        question += '⚠️ 無法從索引或掃描匹配，顯示全部位置圖\n\n';
+    }
     let counter = 1;
     ctx.tgFileMap = [];
 
     for (const r of relevant) {
         ctx.tgFileMap.push({ num: counter, path: r.path, name: r.name });
 
-        let sourceTag = '';
-        if (r.sourceMethod === 'dwg_direct' || r.sourceMethod === 'companion_dwg') sourceTag = ' [DWG]';
-
-        if (r.relevance === 'exact') {
-            const numsStr = r.matchedNumbers.length > 0
-                ? ' 📋 ' + r.matchedNumbers.slice(0, 3).map(fmtDrawingNumber).join(', ')
-                : '';
-            question += `${counter}. ✅ ${r.name}${sourceTag}${numsStr}\n`;
-        } else {
-            question += `${counter}. 📄 ${r.name}${sourceTag}\n`;
-        }
+        const numsStr = r.matchedNumbers.length > 0
+            ? ' 📋 ' + r.matchedNumbers.slice(0, 3).map(fmtDrawingNumber).join(', ')
+            : '';
+        question += `${counter}. ✅ ${r.name}${numsStr}\n`;
         counter++;
     }
 
@@ -1463,17 +1535,31 @@ function makeDwgFindHandler() {
             const tgFiles = result.layoutFiles;
             ctx.tgFiles = tgFiles;
 
-            // 掃描每張位置圖 DWG，提取入面嘅繪圖編號
+            // 掃描每張位置圖 DWG，只保留有包含搜尋圖號嘅 TG
+            const searchNumClean = input.replace(/[-_]/g, '').toUpperCase();
+            const tgScanCache = [];
+            for (const tgPath of tgFiles) {
+                const scan = await scanLayoutDwg(tgPath);
+                const nums = (scan.numbers || []).map(n => n.replace(/[-_]/g, '').toUpperCase());
+                const uniqueNums = [...new Set((scan.numbers || []).map(n => fmtDrawingNumber(n)))];
+                tgScanCache.push({ path: tgPath, scan, nums, uniqueNums });
+            }
+
+            // 過濾出有包含搜尋圖號嘅 TG
+            const matchedCache = tgScanCache.filter(c =>
+                c.nums.some(n => n.includes(searchNumClean) || searchNumClean.includes(n))
+            );
+            const displayCache = matchedCache.length > 0 ? matchedCache : tgScanCache;
+            ctx.tgFiles = displayCache.map(c => c.path);
+
             let msg = `✅ *${fmtDrawingNumber(result.drawingNumber)}* 對應嘅位置圖：\n\n`;
-            let hasDwgContent = false;
-            for (let i = 0; i < tgFiles.length; i++) {
-                const name = path.basename(tgFiles[i]);
-                const scan = await scanLayoutDwg(tgFiles[i]);
-                const nums = scan.numbers || [];
-                const uniqueNums = [...new Set(nums.map(n => fmtDrawingNumber(n)))];
+            let hasMatch = false;
+            for (let i = 0; i < displayCache.length; i++) {
+                const { path: tgPath, scan, uniqueNums } = displayCache[i];
+                const name = path.basename(tgPath);
                 msg += `${i + 1}. 📄 ${name}`;
                 if (uniqueNums.length > 0) {
-                    hasDwgContent = true;
+                    hasMatch = true;
                     msg += `\n   📋 ${uniqueNums.slice(0, 5).join(', ')}`;
                     if (uniqueNums.length > 5) msg += ` 等 ${uniqueNums.length} 個圖號`;
                 } else if (scan.error) {
@@ -1481,14 +1567,13 @@ function makeDwgFindHandler() {
                 }
                 msg += '\n';
             }
-            if (hasDwgContent) msg += `\n來源：DWG 內容提取`;
-            else msg += `\n來源：檔名匹配`;
+            if (!hasMatch) msg += `\n⚠️ 檔名匹配但 DWG 內容無包含圖號 *${input}*`;
+            else msg += `\n來源：DWG 內容提取`;
             msg += `\n\n💡 可用 \`#dwgfind\` 重新查詢其他圖號`;
 
             ctx.foundResult = result;
-            if (tgFiles.length > 0) {
+            if (displayFiles.length > 0) {
                 ctx.step = 'ask_send';
-                ctx.tgFiles = tgFiles;
                 msg += '\n\n需要發送位置圖嗎？\n回覆 `y` 或 `n`';
                 return { question: msg };
             }
@@ -1687,6 +1772,7 @@ module.exports = {
     buildIndex,
     loadIndex,
     searchDrawings,
+    findMatchingFile,
     getTagFile,
     getTagFiles,
     makeDrawingSearchHandler,

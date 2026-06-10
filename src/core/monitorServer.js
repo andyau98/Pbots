@@ -7,6 +7,8 @@
  */
 
 const http = require('http');
+const path = require('path');
+const fs = require('fs');
 const { logStream } = require('./logStream');
 const drawingSearch = require('../../skills/drawingSearch');
 
@@ -44,6 +46,21 @@ class MonitorServer {
                     break;
                 case '/api/deepscan/start':
                     this._serveDeepscanStart(res);
+                    break;
+                case '/drawing':
+                    this._serveDrawingPage(res);
+                    break;
+                case '/api/drawing/search':
+                    this._serveDrawingSearch(url, res);
+                    break;
+                case '/api/drawing/systems':
+                    this._serveDrawingSystems(res);
+                    break;
+                case '/api/drawing/send':
+                    this._serveDrawingSend(url, res);
+                    break;
+                case '/api/drawing/download':
+                    this._serveDrawingDownload(url, res);
                     break;
                 default:
                     res.writeHead(404);
@@ -276,6 +293,191 @@ class MonitorServer {
         res.writeHead(202);
         res.end(JSON.stringify({ message: '掃描已啟動', por: porPath }));
     }
+
+    // ========== 圖紙搜尋 API ==========
+
+    _serveDrawingSearch(url, res) {
+        const q = (url.searchParams.get('q') || '').trim();
+        const system = (url.searchParams.get('system') || '').trim().toUpperCase();
+        const page = parseInt(url.searchParams.get('page') || '1', 10);
+        const pageSize = 20;
+
+        if (!q) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            return res.end(JSON.stringify({ error: '請輸入搜尋關鍵字' }));
+        }
+
+        try {
+            drawingSearch.loadIndex();
+            let results = drawingSearch.searchDrawings(q);
+            if (!results || results.length === 0) {
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ total: 0, results: [], query: q }));
+            }
+
+            if (system) {
+                results = results.filter(r => {
+                    const name = (r.name || '').toUpperCase();
+                    return name.startsWith(system) || name.includes('-' + system);
+                });
+            }
+
+            const enriched = results.map(r => {
+                const ext = (r.ext || path.extname(r.name)).toLowerCase();
+                const folder = r.folder || path.dirname(r.path);
+                const baseName = path.basename(r.name, path.extname(r.name));
+
+                // 搵 companion 檔案（同 base name 嘅 DWG / PDF，排除自身）
+                const companions = [];
+                const curExt = ext;
+                if (curExt !== '.dwg') {
+                    const dwgPath = drawingSearch.findMatchingFile(r.path, '.dwg') || drawingSearch.findMatchingFile(r.path, '.DWG');
+                    if (dwgPath) companions.push({ type: 'dwg', path: dwgPath, name: path.basename(dwgPath) });
+                }
+                if (curExt !== '.dxf') {
+                    const dxfPath = drawingSearch.findMatchingFile(r.path, '.dxf') || drawingSearch.findMatchingFile(r.path, '.DXF');
+                    if (dxfPath) companions.push({ type: 'dxf', path: dxfPath, name: path.basename(dxfPath) });
+                }
+                if (curExt !== '.pdf') {
+                    const pdfPath = drawingSearch.findMatchingFile(r.path, '.pdf') || drawingSearch.findMatchingFile(r.path, '.PDF');
+                    if (pdfPath) companions.push({ type: 'pdf', path: pdfPath, name: path.basename(pdfPath) });
+                }
+
+                // 用 TG mapping 索引過濾：只顯示對應到呢個圖號嘅位置圖
+                const allTgFiles = drawingSearch.getTagFiles(r.path);
+                const nameNums = drawingSearch.extractDrawingNumbers(baseName.toUpperCase());
+                let tgList = [];
+                if (nameNums.length > 0 && allTgFiles.length > 0) {
+                    const matched = drawingSearch.queryTgFromIndex(allTgFiles, nameNums);
+                    if (matched && matched.length > 0) {
+                        // 只顯示 exact 匹配，唔顯示 available（檔名前綴匹配）
+                        const exact = matched.filter(m => m.relevance === 'exact');
+                        if (exact.length > 0) {
+                            tgList = exact.slice(0, 5).map(m => ({
+                                name: path.basename(m.path),
+                                path: m.path,
+                                relevance: m.relevance || '',
+                                matchedNums: (m.matchedNumbers || []).slice(0, 3),
+                            }));
+                        }
+                    }
+                }
+
+                // Fallback：index 無 exact match → 顯示全部 TG
+                if (tgList.length === 0 && allTgFiles.length > 0) {
+                    tgList = allTgFiles.slice(0, 5).map(tf => ({
+                        name: path.basename(tf),
+                        path: tf,
+                        relevance: 'fallback',
+                        matchedNums: [],
+                    }));
+                }
+
+                return {
+                    name: r.name,
+                    path: r.path,
+                    ext,
+                    folder,
+                    system: r.system || '',
+                    companions,
+                    tgCount: allTgFiles.length,
+                    tgFiles: tgList,
+                };
+            });
+
+            const total = enriched.length;
+            const totalPages = Math.ceil(total / pageSize);
+            const paged = enriched.slice((page - 1) * pageSize, page * pageSize);
+
+            const systems = {};
+            enriched.forEach(r => {
+                const sys = r.system || '其他';
+                systems[sys] = (systems[sys] || 0) + 1;
+            });
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                total, totalPages, page, pageSize, query: q,
+                results: paged,
+                systems: Object.entries(systems).map(([k, v]) => ({ code: k, count: v })),
+            }));
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: err.message }));
+        }
+    }
+
+    _serveDrawingSystems(res) {
+        try {
+            const { getDatabase } = require('./database');
+            const db = getDatabase();
+            const rows = db.prepare("SELECT DISTINCT system FROM files WHERE system IS NOT NULL AND system != '' ORDER BY system").all();
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ systems: rows.map(r => r.system) }));
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: err.message }));
+        }
+    }
+
+    _serveDrawingSend(url, res) {
+        const filePath = url.searchParams.get('path') || '';
+        if (!filePath) {
+            res.writeHead(400);
+            return res.end(JSON.stringify({ error: '缺少檔案路徑' }));
+        }
+        try {
+            if (!fs.existsSync(filePath)) {
+                res.writeHead(404);
+                return res.end(JSON.stringify({ error: '檔案不存在' }));
+            }
+            const stat = fs.statSync(filePath);
+            const name = path.basename(filePath);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ name, path: filePath, size: stat.size, mtime: stat.mtime.toISOString() }));
+        } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: err.message }));
+        }
+    }
+
+    _serveDrawingDownload(url, res) {
+        const filePath = url.searchParams.get('path') || '';
+        if (!filePath) {
+            res.writeHead(400);
+            return res.end('Missing path');
+        }
+        try {
+            if (!fs.existsSync(filePath)) {
+                res.writeHead(404);
+                return res.end('File not found');
+            }
+            const stat = fs.statSync(filePath);
+            const name = path.basename(filePath);
+            const ext = path.extname(name).toLowerCase();
+            const mime = ext === '.pdf' ? 'application/pdf' :
+                         ext === '.dwg' ? 'application/acad' :
+                         'application/octet-stream';
+            res.writeHead(200, {
+                'Content-Type': mime,
+                'Content-Length': stat.size,
+                'Content-Disposition': 'inline; filename="' + name + '"',
+                'Cache-Control': 'no-cache',
+            });
+            const stream = fs.createReadStream(filePath);
+            stream.pipe(res);
+        } catch (err) {
+            res.writeHead(500);
+            res.end(err.message);
+        }
+    }
+
+    // ========== 圖紙搜尋頁面 ==========
+
+    _serveDrawingPage(res) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(buildDrawingPage());
+    }
 }
 
 // =============================================================================
@@ -304,6 +506,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .header{background:var(--srf);padding:10px 20px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;height:44px;flex-shrink:0}
 .header h1{font-size:1rem;color:var(--ac);font-weight:600;letter-spacing:-0.3px}
 .header-r{display:flex;align-items:center;gap:10px;font-size:0.75rem;color:var(--t3)}
+.nav-btn{background:var(--srf2);border:1px solid var(--bd);color:var(--t2);padding:4px 12px;border-radius:6px;font-size:0.7rem;cursor:pointer;text-decoration:none;transition:all .15s;white-space:nowrap}
+.nav-btn:hover{background:var(--srf);border-color:var(--ac);color:var(--ac)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%}
 .dot.on{background:var(--gn);box-shadow:0 0 6px var(--gn)}
 .dot.off{background:var(--rd);box-shadow:0 0 6px var(--rd)}
@@ -376,10 +580,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <body>
 <div class="header">
   <h1>PBOTS 監控儀表板</h1>
-  <div class="header-r" id="status-indicator">
-    <span class="dot ${dotClass}"></span>
-    <span id="status-text">${statusText}</span>
-    <span style="margin-left:6px" id="refresh-time"></span>
+  <div style="display:flex;align-items:center;gap:8px">
+    <a href="/drawing" class="nav-btn">🔍 圖紙搜尋</a>
+    <div class="header-r" id="status-indicator">
+      <span class="dot ${dotClass}"></span>
+      <span id="status-text">${statusText}</span>
+      <span style="margin-left:8px" id="refresh-time"></span>
+    </div>
   </div>
 </div>
 <div class="main">
@@ -641,6 +848,215 @@ function updateDashboard(d) {
 }
 
 fetchStatus(); setInterval(fetchStatus, 5000);
+</script>
+</body>
+</html>`;
+}
+
+// ========== 頁面建構（獨立函數，使用 template literal 避免引號逃逸問題）
+// ========== 圖紙搜尋頁面 ==========
+
+function buildDrawingPage() {
+    return `<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PBOTS 圖紙搜尋</title>
+<style>
+:root{--bg:#0a0f1a;--srf:#111827;--srf2:#161f30;--bd:#1e293b;--tx:#e2e8f0;--t2:#94a3b8;--t3:#64748b;--ac:#38bdf8;--gn:#22c55e;--rd:#ef4444;--am:#f59e0b}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
+.header{background:var(--srf);padding:10px 20px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
+.header h1{font-size:1rem;color:var(--ac);font-weight:600}
+.header a{color:var(--t3);font-size:0.75rem;text-decoration:none}
+.header a:hover{color:var(--ac)}
+.search-section{max-width:900px;margin:0 auto;padding:20px}
+.search-box{display:flex;gap:8px;margin-bottom:16px}
+.search-box input{flex:1;background:var(--srf);border:1px solid var(--bd);color:var(--tx);padding:8px 14px;border-radius:6px;font-size:0.9rem;outline:none}
+.search-box input:focus{border-color:var(--ac)}
+.search-box button{background:var(--ac);color:#000;border:none;padding:8px 20px;border-radius:6px;font-size:0.85rem;font-weight:600;cursor:pointer}
+.search-box button:hover{opacity:.9}
+.search-box button:disabled{opacity:.4;cursor:not-allowed}
+.filter-bar{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;align-items:center;min-height:32px}
+.filter-bar .lbl{font-size:0.7rem;color:var(--t3)}
+.sys-tag{background:var(--srf2);border:1px solid var(--bd);color:var(--t2);padding:3px 10px;border-radius:12px;font-size:0.7rem;cursor:pointer;transition:all .15s}
+.sys-tag:hover{background:var(--srf);border-color:var(--t3)}
+.sys-tag.on{background:#1e3a5f;border-color:var(--ac);color:var(--ac)}
+.sys-tag .cnt{color:var(--t3);margin-left:3px}
+.stat-bar{font-size:0.75rem;color:var(--t3);margin-bottom:12px;padding:6px 0}
+.results{display:flex;flex-direction:column;gap:6px}
+.result-item{background:var(--srf);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;transition:border-color .15s}
+.result-item:hover{border-color:#334155}
+.result-item .info{flex:1;min-width:0}
+.result-item .name{font-size:0.85rem;color:var(--tx);font-weight:500;word-break:break-all}
+.result-item .path{font-size:0.6rem;color:var(--t3);margin-top:1px;word-break:break-all;font-family:monospace}
+.result-item .meta{font-size:0.68rem;color:var(--t3);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
+.result-item .actions{display:flex;gap:4px;flex-shrink:0;margin-left:10px}
+.btn{background:var(--srf2);border:1px solid var(--bd);color:var(--t2);padding:4px 10px;border-radius:5px;font-size:0.68rem;cursor:pointer;transition:all .15s;text-decoration:none;display:inline-block}
+.btn:hover{background:var(--srf);border-color:var(--t3);color:var(--tx)}
+.tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:0.6rem;margin-right:3px}
+.tag.dwg{background:#0a1a45;color:var(--ac)}
+.tag.dxf{background:#2d1b4e;color:#c084fc}
+.tag.pdf{background:#450a0a;color:var(--rd)}
+.tg-list{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
+.tg-item{font-size:0.62rem;color:var(--ac);padding:1px 5px;background:rgba(56,189,248,0.08);border-radius:3px;white-space:nowrap;text-decoration:none}
+.tg-item:hover{background:rgba(56,189,248,0.18)}
+.tg-item.exact{color:var(--gn);background:rgba(34,197,94,0.1)}
+.tg-item.exact:hover{background:rgba(34,197,94,0.2)}
+.pagination{display:flex;justify-content:center;gap:6px;margin-top:16px;flex-wrap:wrap}
+.pg-btn{background:var(--srf);border:1px solid var(--bd);color:var(--t2);padding:6px 14px;border-radius:5px;font-size:0.75rem;cursor:pointer;transition:all .15s}
+.pg-btn:hover{background:var(--srf2);border-color:var(--t3)}
+.pg-btn.on{background:#1e3a5f;border-color:var(--ac);color:var(--ac)}
+.pg-btn:disabled{opacity:.3;cursor:not-allowed}
+.loading{text-align:center;padding:40px;color:var(--t3);font-size:0.85rem}
+.empty{text-align:center;padding:60px 20px;color:var(--t3)}
+.empty .icon{font-size:2.5rem;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🔍 圖紙搜尋</h1>
+  <a href="/" class="nav-btn">← 儀表板</a>
+</div>
+<div class="search-section">
+  <div class="search-box">
+    <input id="search-input" type="text" placeholder="輸入圖號，例如 ACD0060 或 FST-2031..." autofocus>
+    <button id="search-btn">搜尋</button>
+  </div>
+  <div class="filter-bar" id="filter-bar">
+    <span class="lbl">系統：</span>
+    <span class="sys-tag on" data-sys="">全部</span>
+  </div>
+  <div class="stat-bar" id="stat-bar"></div>
+  <div class="results" id="results"></div>
+  <div class="pagination" id="pagination"></div>
+</div>
+
+<script>
+var curQ = '', curSys = '', curPage = 1, totalPg = 1;
+
+document.getElementById('search-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') search();
+});
+document.getElementById('search-btn').addEventListener('click', search);
+
+function search(pg) {
+    var q = document.getElementById('search-input').value.trim();
+    if (!q) return;
+    curQ = q; curPage = pg || 1;
+    doSearch();
+}
+
+async function doSearch() {
+    var btn = document.getElementById('search-btn');
+    btn.disabled = true; btn.textContent = '搜尋中…';
+    document.getElementById('results').innerHTML = '<div class="loading">⏳ 搜尋中...</div>';
+
+    try {
+        var url = '/api/drawing/search?q=' + encodeURIComponent(curQ) + '&page=' + curPage;
+        if (curSys) url += '&system=' + encodeURIComponent(curSys);
+        var resp = await fetch(url);
+        var d = await resp.json();
+
+        if (d.error) {
+            document.getElementById('results').innerHTML = '<div class="empty"><div class="icon">❌</div>' + hesc(d.error) + '</div>';
+            return;
+        }
+
+        renderFilter(d.systems);
+        document.getElementById('stat-bar').textContent = '找到 ' + d.total + ' 個結果（' + d.page + '/' + d.totalPages + ' 頁）';
+        renderList(d.results);
+        renderPages(d);
+    } catch(e) {
+        document.getElementById('results').innerHTML = '<div class="empty"><div class="icon">⚠️</div>搜尋失敗</div>';
+    } finally {
+        btn.disabled = false; btn.textContent = '搜尋';
+    }
+}
+
+function renderFilter(systems) {
+    var bar = document.getElementById('filter-bar');
+    var h = '<span class="lbl">系統：</span>';
+    h += '<span class="sys-tag' + (curSys === '' ? ' on' : '') + '" data-sys="">全部</span>';
+    if (systems) for (var i = 0; i < systems.length; i++)
+        h += '<span class="sys-tag' + (curSys === systems[i].code ? ' on' : '') + '" data-sys="' + systems[i].code + '">' + systems[i].code + ' <span class="cnt">(' + systems[i].count + ')</span></span>';
+    bar.innerHTML = h;
+    bar.querySelectorAll('.sys-tag').forEach(function(el) {
+        el.addEventListener('click', function() {
+            curSys = this.getAttribute('data-sys'); curPage = 1; doSearch();
+        });
+    });
+}
+
+function renderList(items) {
+    var c = document.getElementById('results');
+    if (!items || !items.length) {
+        c.innerHTML = '<div class="empty"><div class="icon">📄</div>無符合結果</div>';
+        return;
+    }
+    var h = '';
+    for (var i = 0; i < items.length; i++) {
+        var r = items[i];
+
+        // 主要檔案連結
+        var mainLink = '/api/drawing/download?path=' + encodeURIComponent(r.path);
+
+        // 加工圖 companion
+        var compHtml = '';
+        if (r.companions && r.companions.length) {
+            for (var j = 0; j < r.companions.length; j++) {
+                var ct = r.companions[j];
+                var clink = '/api/drawing/download?path=' + encodeURIComponent(ct.path);
+                compHtml += '<a class="tag ' + ct.type + '" href="' + clink + '" target="_blank">' + ct.type.toUpperCase() + '</a>';
+            }
+        }
+
+        // 位置圖（只顯示對應嘅）
+        var tgHtml = '';
+        if (r.tgFiles && r.tgFiles.length) {
+            tgHtml = '<div class="tg-list">';
+            for (var j = 0; j < r.tgFiles.length; j++) {
+                var tg = r.tgFiles[j];
+                var tglink = '/api/drawing/download?path=' + encodeURIComponent(tg.path);
+                var tagRel = tg.relevance === 'exact' ? ' ✅' : (tg.relevance === 'fallback' ? ' ⚠️' : '');
+                var extra = tg.matchedNums && tg.matchedNums.length ? ' (' + tg.matchedNums.join(', ') + ')' : '';
+                tgHtml += '<a class="tg-item' + (tg.relevance === 'exact' ? ' exact' : '') + '" href="' + tglink + '" target="_blank">📍 ' + hesc(tg.name) + extra + tagRel + '</a>';
+            }
+            tgHtml += '</div>';
+        }
+
+        h += '<div class="result-item">';
+        h += '<div class="info">';
+        h += '<div class="name"><a href="' + mainLink + '" target="_blank" style="color:var(--tx);text-decoration:none">' + hesc(r.name) + '</a></div>';
+        h += '<div class="path">' + hesc(r.path) + '</div>';
+        h += '<div class="meta">';
+        h += '<a class="tag" style="background:var(--srf2);color:var(--t3);text-decoration:none;cursor:default">' + (r.ext || '').toUpperCase() + '</a>';
+        h += compHtml;
+        h += ' <span>' + hesc(r.system || '') + '</span></div>';
+        h += tgHtml;
+        h += '</div>';
+        h += '<div class="actions"><a class="btn" href="' + mainLink + '" target="_blank">📂</a></div>';
+        h += '</div>';
+    }
+    c.innerHTML = h;
+}
+
+function renderPages(d) {
+    totalPg = d.totalPages;
+    var c = document.getElementById('pagination');
+    if (totalPg <= 1) { c.innerHTML = ''; return; }
+    var h = '<button class="pg-btn" onclick="goPage(1)"' + (d.page <= 1 ? ' disabled' : '') + '>«</button>';
+    h += '<button class="pg-btn" onclick="goPage(' + (d.page-1) + ')"' + (d.page <= 1 ? ' disabled' : '') + '>‹</button>';
+    var s = Math.max(1, d.page-2), e = Math.min(totalPg, d.page+2);
+    for (var p = s; p <= e; p++) h += '<button class="pg-btn' + (p === d.page ? ' on' : '') + '" onclick="goPage('+p+')">'+p+'</button>';
+    h += '<button class="pg-btn" onclick="goPage(' + (d.page+1) + ')"' + (d.page >= totalPg ? ' disabled' : '') + '>›</button>';
+    h += '<button class="pg-btn" onclick="goPage('+totalPg+')"' + (d.page >= totalPg ? ' disabled' : '') + '>»</button>';
+    c.innerHTML = h;
+}
+
+function goPage(p) { if (p < 1 || p > totalPg) return; curPage = p; doSearch(); }
+function hesc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 </script>
 </body>
 </html>`;

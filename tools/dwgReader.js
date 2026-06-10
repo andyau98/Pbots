@@ -150,12 +150,24 @@ function runDwgread(dwgPath, timeout = 120000) {
                 return;
             }
             try {
-                let raw = fs.readFileSync(tmpOut, 'utf-8');
+                let raw;
+                let data;
+                const tmpStat = fs.statSync(tmpOut);
 
-                // 修正 libredwg 0.13.4 JSON 輸出嘅問題（nan、不完整小數）
-                raw = fixDwgJson(raw);
+                try {
+                    raw = fs.readFileSync(tmpOut, 'utf-8');
+                    raw = fixDwgJson(raw);
+                    data = JSON.parse(raw);
+                } catch (parseErr) {
+                    // 如果係 V8 string limit 問題 → 用 buffer 模式逐段掃瞄
+                    if (parseErr.message && parseErr.message.includes('Cannot create a string longer than')) {
+                        console.log(`  ⚠️ 超大 JSON (${(tmpStat.size / 1024 / 1024).toFixed(1)}MB)，用掃瞄模式提取文字`);
+                        data = scanHugeJson(tmpOut);
+                    } else {
+                        throw parseErr;
+                    }
+                }
 
-                const data = JSON.parse(raw);
                 resolve(data);
             } catch (e) {
                 reject(new Error(`JSON 解析失敗: ${e.message}`));
@@ -243,6 +255,93 @@ function parseDwgJson(data) {
     }
 
     return results;
+}
+
+/**
+ * 掃瞄超大 JSON 檔案提取文字（避開 V8 string limit ~512MB）
+ * 用 Buffer 逐段搜尋 "entity":"MTEXT" 同 "text":"..." 模式，唔需要完整 parse
+ * @param {string} filePath
+ * @returns {object} 符合 parseDwgJson input 格式嘅 object
+ */
+function scanHugeJson(filePath) {
+    const fd = fs.openSync(filePath, 'r');
+    const CHUNK = 64 * 1024; // 64KB chunks
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const objects = [];
+    let buffer = Buffer.alloc(0);
+
+    try {
+        for (let offset = 0; offset < fileSize; offset += CHUNK) {
+            const chunkSize = Math.min(CHUNK, fileSize - offset);
+            const chunk = Buffer.alloc(chunkSize);
+            fs.readSync(fd, chunk, 0, chunkSize, offset);
+            buffer = Buffer.concat([buffer, chunk]);
+
+            // 保留最後 200 bytes 做 overlap（避免切斷 JSON field）
+            if (buffer.length > 200) {
+                processBufferChunk(buffer.slice(0, -200), objects);
+                buffer = buffer.slice(-200);
+            }
+        }
+        // 處理剩餘嘅 buffer
+        if (buffer.length > 0) processBufferChunk(buffer, objects);
+    } finally {
+        fs.closeSync(fd);
+    }
+
+    return { OBJECTS: objects };
+}
+
+/** 喺 buffer chunk 入面搵 MTEXT 同 INSERT/ATTRIB 文字 */
+function processBufferChunk(buf, objects) {
+    // 搵 "entity":"MTEXT" 附近嘅 text field
+    let idx = 0;
+    while (idx < buf.length) {
+        // 搵 entity 類型
+        const mtextPos = buf.indexOf('"entity":"MTEXT"', idx);
+        const insertPos = buf.indexOf('"entity":"INSERT"', idx);
+        let pos = -1, type = '';
+        if (mtextPos >= 0 && (insertPos < 0 || mtextPos < insertPos)) {
+            pos = mtextPos; type = 'MTEXT';
+        } else if (insertPos >= 0) {
+            pos = insertPos; type = 'INSERT';
+        }
+        if (pos < 0) break;
+
+        // 喺附近搵 text field
+        const searchEnd = Math.min(pos + 5000, buf.length);
+        const regionStr = buf.slice(pos, searchEnd).toString('utf-8');
+
+        if (type === 'MTEXT') {
+            const textMatch = regionStr.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+            if (textMatch && textMatch[1].trim()) {
+                objects.push({ entity: 'MTEXT', text: textMatch[1] });
+            }
+        } else if (type === 'INSERT') {
+            // 搵 attribs 入面嘅文字
+            const attribs = [];
+            let apos = 0;
+            while (apos < regionStr.length && attribs.length < 20) {
+                const aStart = regionStr.indexOf('"text"', apos);
+                if (aStart < 0) break;
+                const valEnd = regionStr.indexOf(':', aStart + 6);
+                if (valEnd < 0) break;
+                const quote1 = regionStr.indexOf('"', valEnd + 1);
+                if (quote1 < 0) break;
+                const quote2 = regionStr.indexOf('"', quote1 + 1);
+                if (quote2 < 0) break;
+                const text = regionStr.slice(quote1 + 1, quote2);
+                if (text && text.trim()) attribs.push({ text: text.trim() });
+                apos = quote2 + 1;
+            }
+            if (attribs.length > 0) {
+                objects.push({ entity: 'INSERT', attribs, has_attribs: true });
+            }
+        }
+
+        idx = pos + 1;
+    }
 }
 
 /**
