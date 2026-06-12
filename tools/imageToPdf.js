@@ -23,10 +23,15 @@ const CHINESE_FONT = (() => {
             }
         }
         // Windows
-        const winFont = 'C:/Windows/Fonts/simhei.ttf';
-        if (fs.existsSync(winFont)) {
-            console.log(`✅ 中文字體: ${winFont}`);
-            return winFont;
+        const winFonts = [
+            'C:/Windows/Fonts/simhei.ttf',
+            path.join(__dirname, 'fonts', 'simhei.ttf'), // 專案內置 fallback
+        ];
+        for (const fp of winFonts) {
+            if (fs.existsSync(fp)) {
+                console.log(`✅ 中文字體: ${fp}`);
+                return fp;
+            }
         }
         // Linux
         const linuxFont =

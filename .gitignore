@@ -49,3 +49,6 @@ ecosystem.config.js
 # Temporary/dev artifacts
 _tmp_*.js
 nul'
+
+# Downloaded fonts (not source code)
+tools/fonts/

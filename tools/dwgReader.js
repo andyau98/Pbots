@@ -99,96 +99,94 @@ function killHungDwgread(pid) {
 
 /**
  * 執行 dwgread 並回傳 JSON
+ * 策略：先試直接讀 → ERROR 0x1000（網絡磁碟機）先抄去本機暫存重試
  * @param {string} dwgPath - DWG 檔案路徑
  * @param {number} [timeout=120000] - 超時時間（毫秒）
  */
-function runDwgread(dwgPath, timeout = 120000) {
+async function runDwgread(dwgPath, timeout = 120000) {
     const exe = getDwgreadPath();
     if (!exe) {
-        return Promise.reject(new Error('找不到 dwgread 工具。請安裝 libredwg。'));
+        throw new Error('找不到 dwgread 工具。請安裝 libredwg。');
     }
-
-    // 每次執行前 kill 之前殘留嘅 zombie process
     killHungDwgread();
 
-    return new Promise((resolve, reject) => {
-        // Windows: 將 libredwg 目錄加入 PATH 以便載入 DLL
-        const env = { ...process.env };
-        const exeDir = path.dirname(exe);
-        if (os.platform() === 'win32') {
-            env.PATH = exeDir + path.delimiter + (env.PATH || '');
-        } else if (os.platform() === 'darwin') {
-            const libDir = exeDir.replace('programs', 'src');
-            env.DYLD_LIBRARY_PATH = (env.DYLD_LIBRARY_PATH || '') + ':' + libDir;
-        }
+    // Windows: 將 libredwg 目錄加入 PATH 以便載入 DLL
+    const env = { ...process.env };
+    const exeDir = path.dirname(exe);
+    if (os.platform() === 'win32') {
+        env.PATH = exeDir + path.delimiter + (env.PATH || '');
+    } else if (os.platform() === 'darwin') {
+        env.DYLD_LIBRARY_PATH = (env.DYLD_LIBRARY_PATH || '') + ':' + exeDir.replace('programs', 'src');
+    }
 
-        // 輸出到暫存檔（避免 stdout buffer 上限 + 處理效率）
-        const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        const tmpOut = path.join(os.tmpdir(), `dwg_${uniqueId}_${path.basename(dwgPath)}.json`);
+    const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const tmpOut = path.join(os.tmpdir(), `dwg_${uniqueId}_${path.basename(dwgPath)}.json`);
 
-        // 自家 timeout 機制（Windows execFile timeout 唔會 kill child process）
-        let timedOut = false;
-        let childPid = null;
+    /** 內部執行 dwgread，回傳 {data, stderr, exitCode} */
+    const _exec = (inputPath) => new Promise((_resolve) => {
+        let timedOut = false, childPid = null;
         const timer = setTimeout(() => {
             timedOut = true;
-            if (childPid !== null) killHungDwgread(childPid);
-            reject(new Error(`dwgread 超時 (${timeout}ms): ${dwgPath}`));
+            if (childPid) killHungDwgread(childPid);
+            _resolve({ data: null, stderr: 'timeout', exitCode: -1 });
         }, timeout);
 
-        const child = execFile(exe, ['-O', 'minJSON', '-o', tmpOut, dwgPath], {
-            timeout: timeout + 5000, // 比自家 timeout 長少少，等 callback 唔會 race
-            env,
-        }, (err, stdout, stderr) => {
+        const child = execFile(exe, ['-O', 'minJSON', '-o', tmpOut, inputPath], {
+            timeout: timeout + 5000, env,
+        }, (err, _stdout, stderrRaw) => {
             clearTimeout(timer);
-            if (timedOut) return; // 已經 reject 咗
-
+            if (timedOut) return;
+            const stderrStr = stderrRaw ? stderrRaw.toString('utf-8') : '';
+            const exitCode = err ? (err.code || 1) : 0;
             if (err && !fs.existsSync(tmpOut)) {
-                const errMsg = stderr
-                    ? stderr.toString('utf-8').slice(0, 300)
-                    : err.message;
-                reject(new Error(`dwgread 失敗: ${errMsg}`));
+                _resolve({ data: null, stderr: stderrStr, exitCode });
                 return;
             }
             try {
-                let raw;
+                const stat = fs.statSync(tmpOut);
                 let data;
-                const tmpStat = fs.statSync(tmpOut);
-
                 try {
-                    raw = fs.readFileSync(tmpOut, 'utf-8');
+                    let raw = fs.readFileSync(tmpOut, 'utf-8');
                     raw = fixDwgJson(raw);
                     data = JSON.parse(raw);
                 } catch (parseErr) {
-                    // 如果係 V8 string limit 問題 → 用 buffer 模式逐段掃瞄
-                    if (parseErr.message && parseErr.message.includes('Cannot create a string longer than')) {
-                        console.log(`  ⚠️ 超大 JSON (${(tmpStat.size / 1024 / 1024).toFixed(1)}MB)，用掃瞄模式提取文字`);
+                    if (parseErr.message?.includes('Cannot create a string longer than')) {
+                        console.log(`  ⚠️ 超大 JSON (${(stat.size / 1024 / 1024).toFixed(1)}MB)，用掃瞄模式提取文字`);
                         data = scanHugeJson(tmpOut);
-                    } else {
-                        throw parseErr;
-                    }
+                    } else { throw parseErr; }
                 }
-
-                resolve(data);
+                _resolve({ data, stderr: stderrStr, exitCode });
             } catch (e) {
-                reject(new Error(`JSON 解析失敗: ${e.message}`));
+                _resolve({ data: null, stderr: stderrStr, exitCode });
             } finally {
-                try { fs.unlinkSync(tmpOut); } catch { /* ignore */ }
+                try { fs.unlinkSync(tmpOut); } catch {}
             }
         });
 
-        // 追蹤 PID 以便精準 kill（唔影響並行提取）
         childPid = child.pid;
         if (childPid) _activePids.add(childPid);
-
-        // 額外保險：child exit 後移除 PID 紀錄
         child.on('exit', () => {
             clearTimeout(timer);
-            if (childPid) {
-                _activePids.delete(childPid);
-                killHungDwgread(childPid);
-            }
+            if (childPid) { _activePids.delete(childPid); killHungDwgread(childPid); }
         });
     });
+
+    // 第一次嘗試：直接讀原路徑
+    let result = await _exec(dwgPath);
+
+    // 網絡磁碟機 fallback：libredwg C library ERROR 0x1000 = 唔支援網絡路徑
+    let localCopy = null;
+    if (!result.data && result.stderr && result.stderr.includes('ERROR 0x1000')) {
+        localCopy = path.join(os.tmpdir(), `dwg_in_${uniqueId}_${path.basename(dwgPath)}`);
+        fs.copyFileSync(dwgPath, localCopy);
+        result = await _exec(localCopy);
+        try { fs.unlinkSync(localCopy); } catch {}
+    }
+
+    if (!result.data) {
+        throw new Error(`dwgread 失敗: ${result.stderr.slice(0, 300) || `exit ${result.exitCode}`}`);
+    }
+    return result.data;
 }
 
 /**

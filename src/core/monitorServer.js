@@ -41,6 +41,18 @@ class MonitorServer {
                 case '/api/deepscan/progress':
                     this._serveDeepscanProgress(res);
                     break;
+                case '/api/deepscan/files':
+                    this._serveDeepscanFiles(url, res);
+                    break;
+                case '/api/deepscan/download':
+                    this._serveDeepscanDownload(url, res);
+                    break;
+                case '/api/deepscan/pause':
+                    this._serveDeepscanPause(res);
+                    break;
+                case '/api/deepscan/resume':
+                    this._serveDeepscanResume(res);
+                    break;
                 case '/deepscan':
                     this._serveDeepscanPage(res);
                     break;
@@ -244,27 +256,120 @@ class MonitorServer {
     // ========== DeepScan Progress API ==========
 
     _serveDeepscanProgress(res) {
+        // Auto-load progress from DB if empty
+        const dp = drawingSearch.deepscanProgress;
+        if (!dp.fileOrder || dp.fileOrder.length === 0 || (!dp.running && dp.paused === false && dp.total === 0)) {
+            try { drawingSearch.loadIndex(); } catch {}
+        }
         const p = drawingSearch.deepscanProgress || {};
         const elapsed = p.startTime ? (Date.now() - new Date(p.startTime).getTime()) : 0;
-        const pct = p.total > 0 ? Math.min(100, Math.round(p.current / p.total * 100)) : 0;
+        const pct = p.percent || (p.total > 0 ? Math.min(100, Math.round((p.current || 0) / p.total * 100)) : 0);
+
+        // 統計 by status（計埋 skipped folder 嘅 cached/done 檔案）
+        let doneCount = 0, pendingCount = 0, errorCount = 0, cachedCount = 0, scanningCount = 0, skippedCount = 0;
+        const errorFiles = [];
+        for (const [fp, fd] of Object.entries(p.fileDetails || {})) {
+            switch (fd.status) {
+                case 'done': doneCount++; break;
+                case 'cached': cachedCount++; break;
+                case 'scanning': scanningCount++; break;
+                case 'error': errorCount++; errorFiles.push({ path: fp, name: fd.name, error: fd.error?.substring(0, 200) }); break;
+                case 'skipped': skippedCount++; break;
+                default: pendingCount++; break;
+            }
+        }
+
+        // completedCount = 已完成 + 快取命中 + 跳過嘅
+        const completedCount = doneCount + cachedCount + skippedCount;
+        const displayCurrent = p.running ? (p.current || 0) : completedCount;
+        const displayPct = p.running ? pct : (p.total > 0 ? Math.min(100, Math.round(completedCount / p.total * 100)) : 0);
 
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
             running: p.running || false,
+            paused: p.paused || false,
             total: p.total || 0,
-            current: p.current || 0,
-            percent: pct,
+            current: displayCurrent,
+            percent: displayPct,
             currentFile: p.currentFile || '',
             scannedCount: p.scannedCount || 0,
-            cachedCount: p.cachedCount || 0,
-            errorCount: p.errorCount || 0,
+            cachedCount: cachedCount,
+            errorCount: errorCount,
             mappingCount: p.mappingCount || 0,
             dwgCount: p.dwgCount || 0,
-            phase: p.phase || '',
+            phase: p.phase || (p.total > 0 ? '資料已載入' : '待機中'),
             elapsedMs: elapsed,
             elapsedText: formatDuration(elapsed),
             startTime: p.startTime || '',
+            lastCheckpoint: p.lastCheckpoint || '',
+            // 狀態統計（確保唔係 undefined）
+            statusCounts: { done: doneCount, cached: cachedCount, scanning: scanningCount, pending: pendingCount, error: errorCount, skipped: skippedCount },
+            errorFiles: errorFiles.slice(0, 50),
+            fileOrder: p.fileOrder || [],
+            fileDetails: p.fileDetails || {},
         }));
+    }
+
+    _serveDeepscanFiles(url, res) {
+        const p = drawingSearch.deepscanProgress || {};
+        const status = (url.searchParams.get('status') || '').trim();
+        const page = parseInt(url.searchParams.get('page') || '1', 10);
+        const pageSize = parseInt(url.searchParams.get('pageSize') || '50', 10);
+
+        let files = [];
+        for (const [fp, fd] of Object.entries(p.fileDetails || {})) {
+            if (!status || fd.status === status) {
+                files.push({ path: fp, name: fd.name, folder: fd.folder, status: fd.status, size: fd.size, numbers: (fd.numbers || []).slice(0, 20), numCount: (fd.numbers || []).length, error: fd.error || '' });
+            }
+        }
+
+        // 分頁
+        const total = files.length;
+        const start = (page - 1) * pageSize;
+        files = files.slice(start, start + pageSize);
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ total, page, pageSize, files }));
+    }
+
+    _serveDeepscanDownload(url, res) {
+        const filePath = url.searchParams.get('path');
+        if (!filePath) {
+            res.writeHead(400);
+            return res.end(JSON.stringify({ error: '需要 path 參數' }));
+        }
+        try {
+            const stat = fs.statSync(filePath);
+            const fileName = path.basename(filePath);
+            const fileExt = path.extname(filePath).toLowerCase();
+
+            let contentType = 'application/octet-stream';
+            if (fileExt === '.pdf') contentType = 'application/pdf';
+            else if (fileExt === '.dwg') contentType = 'application/acad';
+            else if (fileExt === '.dxf') contentType = 'application/dxf';
+
+            res.writeHead(200, {
+                'Content-Type': contentType,
+                'Content-Disposition': `inline; filename="${encodeURIComponent(fileName)}"`,
+                'Content-Length': stat.size,
+            });
+            fs.createReadStream(filePath).pipe(res);
+        } catch (e) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: '檔案不存在: ' + e.message }));
+        }
+    }
+
+    _serveDeepscanPause(res) {
+        drawingSearch.deepscanProgress.paused = true;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ paused: true, checkpoint: drawingSearch.deepscanProgress.lastCheckpoint }));
+    }
+
+    _serveDeepscanResume(res) {
+        drawingSearch.deepscanProgress.paused = false;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ paused: false }));
     }
 
     _serveDeepscanPage(res) {
@@ -582,6 +687,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
   <h1>PBOTS 監控儀表板</h1>
   <div style="display:flex;align-items:center;gap:8px">
     <a href="/drawing" class="nav-btn">🔍 圖紙搜尋</a>
+    <a href="/deepscan" class="nav-btn">🔎 TG 位置圖掃描</a>
     <div class="header-r" id="status-indicator">
       <span class="dot ${dotClass}"></span>
       <span id="status-text">${statusText}</span>
@@ -1080,96 +1186,329 @@ function buildDeepscanPage() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>PBOTS TG 位置圖掃描進度</title>
+<title>PBOTS TG 位置圖 Deep Scan</title>
 <style>
-:root{--bg:#0a0f1a;--srf:#111827;--srf2:#161f30;--bd:#1e293b;--tx:#e2e8f0;--t2:#94a3b8;--t3:#64748b;--ac:#38bdf8;--gn:#22c55e;--rd:#ef4444;--am:#f59e0b}
+:root{--bg:#0a0f1a;--srf:#111827;--srf2:#161f30;--bd:#1e293b;--tx:#e2e8f0;--t2:#94a3b8;--t3:#64748b;--ac:#38bdf8;--gn:#22c55e;--rd:#ef4444;--am:#f59e0b;--pl:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
-.container{max-width:600px;width:100%;background:var(--srf);border:1px solid var(--bd);border-radius:16px;padding:32px}
-h1{font-size:1.2rem;color:var(--ac);margin-bottom:8px;text-align:center}
-.sub{font-size:0.75rem;color:var(--t3);text-align:center;margin-bottom:24px}
-.progress-wrap{background:var(--srf2);border-radius:12px;padding:24px;margin-bottom:16px}
-.progress-label{display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:8px}
-.progress-label .pct{color:var(--ac);font-weight:700;font-size:1.5rem}
-.progress-label .count{color:var(--t2)}
-.bar-bg{height:20px;background:var(--bd);border-radius:10px;overflow:hidden;margin-bottom:12px}
-.bar-fill{height:100%;background:linear-gradient(90deg,var(--ac),var(--gn));border-radius:10px;transition:width .5s ease;width:0%}
-.filename{font-size:0.75rem;color:var(--t2);font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:4px 0}
-.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:16px}
-.stat-box{background:var(--srf2);border-radius:8px;padding:12px;text-align:center}
-.stat-box .num{font-size:1.3rem;font-weight:700;color:var(--tx)}
-.stat-box .lbl{font-size:0.65rem;color:var(--t3);margin-top:2px}
-.stat-box .num.gn{color:var(--gn)}
-.stat-box .num.am{color:var(--am)}
-.stat-box .num.rd{color:var(--rd)}
-.phase{display:flex;justify-content:center;align-items:center;gap:8px;font-size:0.8rem;color:var(--t2);padding:8px}
-.phase .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top:2px solid var(--ac);border-radius:50%;animation:spin .8s linear infinite}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft JhengHei",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px}
+.container{max-width:1400px;margin:0 auto}
+h1{font-size:1.2rem;color:var(--ac);margin-bottom:8px}
+.sub{font-size:0.75rem;color:var(--t3);margin-bottom:16px}
+
+/* Control bar */
+.controls{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+.btn{padding:8px 16px;border-radius:8px;border:none;font-size:0.8rem;font-weight:600;cursor:pointer;transition:all .2s}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-go{background:var(--ac);color:#000}
+.btn-go:hover:not(:disabled){background:#7dd3fc}
+.btn-pause{background:var(--am);color:#000}
+.btn-pause:hover:not(:disabled){background:#fbbf24}
+.btn-resume{background:var(--gn);color:#000}
+.btn-resume:hover:not(:disabled){background:#4ade80}
+.btn-back{background:var(--bd);color:var(--t2)}
+.btn-back:hover{color:var(--tx)}
+
+.filter-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+.filter-btn{padding:5px 14px;border-radius:6px;border:1px solid var(--bd);background:var(--srf2);color:var(--t2);font-size:0.72rem;cursor:pointer}
+.filter-btn.active{border-color:var(--ac);color:var(--ac);background:rgba(56,189,248,.1)}
+.filter-btn .cnt{font-size:0.65rem;margin-left:4px;opacity:.7}
+
+/* Stats row */
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:6px;margin-bottom:12px}
+.stat-box{background:var(--srf2);border-radius:8px;padding:8px 12px;text-align:center}
+.stat-box .num{font-size:1.1rem;font-weight:700}
+.stat-box .lbl{font-size:0.6rem;color:var(--t3);margin-top:1px}
+.num.gn{color:var(--gn)} .num.am{color:var(--am)} .num.rd{color:var(--rd)} .num.pl{color:var(--pl)} .num.ac{color:var(--ac)}
+
+/* Progress */
+.progress-wrap{background:var(--srf2);border-radius:10px;padding:16px;margin-bottom:12px}
+.progress-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.progress-top .pct{font-size:1.4rem;font-weight:700;color:var(--ac)}
+.progress-top .info{font-size:0.72rem;color:var(--t2)}
+.bar-bg{height:22px;background:var(--bd);border-radius:11px;overflow:hidden;margin-bottom:6px}
+.bar-fill{height:100%;background:linear-gradient(90deg,var(--ac),var(--gn));border-radius:11px;transition:width .3s ease;width:0%}
+.current-file{font-size:0.7rem;color:var(--t3);font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.phase-text{font-size:0.72rem;color:var(--t2);display:flex;align-items:center;gap:6px}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top:2px solid var(--ac);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.phase.done{color:var(--gn)}
-.phase.done .spinner{display:none}
-.phase.idle .spinner{display:none}
-.back-link{display:block;text-align:center;margin-top:16px;font-size:0.75rem;color:var(--t3)}
-.back-link a{color:var(--ac);text-decoration:none}
-.back-link a:hover{text-decoration:underline}
+
+/* File list */
+.file-list{margin-bottom:16px}
+.file-item{background:var(--srf2);border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-bottom:4px;display:flex;align-items:center;gap:10px;font-size:0.73rem}
+.file-item .idx{min-width:28px;color:var(--t3);text-align:right}
+.file-item .st-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.st-dot.done{background:var(--gn)}
+.st-dot.cached{background:var(--ac)}
+.st-dot.scanning{background:var(--am);animation:pulse .6s infinite}
+.st-dot.pending{background:var(--t3)}
+.st-dot.error{background:var(--rd)}
+.st-dot.skipped{background:var(--pl)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.file-item .name{flex:1;cursor:pointer;color:var(--tx);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-item .name:hover{color:var(--ac);text-decoration:underline}
+.file-item .nums{color:var(--t3);font-size:0.68rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.file-item .size{color:var(--t3);font-size:0.68rem;white-space:nowrap}
+.file-item .err{color:var(--rd);font-size:0.68rem;max-width:200px;overflow:hidden;text-overflow:ellipsis}
+
+/* Empty state */
+.empty{text-align:center;padding:40px;color:var(--t3)}
+
+/* Pagination */
+.pagination{display:flex;gap:4px;justify-content:center;margin:12px 0}
+.page-btn{padding:5px 12px;border-radius:6px;border:1px solid var(--bd);background:var(--srf2);color:var(--t2);font-size:0.72rem;cursor:pointer}
+.page-btn.active{background:var(--ac);color:#000;border-color:var(--ac)}
+.page-btn:disabled{opacity:.3;cursor:not-allowed}
+
+/* Suggestions section */
+.suggestions{background:var(--srf);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-top:16px}
+.suggestions h3{font-size:0.85rem;color:var(--pl);margin-bottom:8px}
+.suggestions ul{list-style:none;padding:0}
+.suggestions li{font-size:0.72rem;color:var(--t2);padding:2px 0}
+.suggestions li::before{content:"💡 ";margin-right:4px}
+
+/* Responsive */
+@media(max-width:768px){
+    .file-item .nums,.file-item .size{display:none}
+    .stats-row{grid-template-columns:repeat(4,1fr)}
+}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>🔍 TG 位置圖掃描</h1>
-  <div class="sub">完整重建位置圖映射索引進度</div>
+  <h1>🔍 TG 位置圖 Deep Scan</h1>
+  <div class="sub">完整重建位置圖映射索引 — 即時進度 + 檔案層級追蹤</div>
 
+  <!-- Control bar -->
+  <div class="controls">
+    <button class="btn btn-go" id="btn-start" onclick="startScan()">▶ 開始掃描</button>
+    <button class="btn btn-pause" id="btn-pause" onclick="pauseScan()" disabled>⏸ 暫停</button>
+    <button class="btn btn-resume" id="btn-resume" onclick="resumeScan()" disabled>▶ 繼續</button>
+    <a class="btn btn-back" href="/">← 返回儀表板</a> <a class="btn btn-back" href="/drawing" style="margin-left:4px">🔍 圖紙搜尋</a>
+    <span style="font-size:0.7rem;color:var(--t3);margin-left:8px" id="checkpoint-info"></span>
+  </div>
+
+  <!-- Progress -->
   <div class="progress-wrap">
-    <div class="progress-label">
+    <div class="progress-top">
       <span class="pct" id="pct">0%</span>
-      <span class="count" id="count">0 / 0</span>
+      <span class="info" id="count-info">0 / 0</span>
     </div>
     <div class="bar-bg"><div class="bar-fill" id="bar"></div></div>
-    <div class="filename" id="filename">—</div>
+    <div class="current-file" id="filename">—</div>
+    <div class="phase-text" id="phase-line">
+      <span class="spinner" id="spinner"></span>
+      <span id="phase-text">待機中…</span>
+      <span style="margin-left:auto;font-size:0.7rem" id="elapsed"></span>
+    </div>
   </div>
 
-  <div class="stats">
-    <div class="stat-box"><div class="num" id="s-scanned">0</div><div class="lbl">已掃描</div></div>
-    <div class="stat-box"><div class="num" id="s-cached">0</div><div class="lbl">快取命中</div></div>
-    <div class="stat-box"><div class="num gn" id="s-mappings">0</div><div class="lbl">映射數</div></div>
-    <div class="stat-box"><div class="num am" id="s-errors">0</div><div class="lbl">錯誤</div></div>
+  <!-- Stats -->
+  <div class="stats-row">
+    <div class="stat-box"><div class="num" id="s-total">—</div><div class="lbl">總 TG 圖</div></div>
+    <div class="stat-box"><div class="num ac" id="s-dwg">—</div><div class="lbl">DWG 位置圖</div></div>
+    <div class="stat-box"><div class="num gn" id="s-done">—</div><div class="lbl">已完成</div></div>
+    <div class="stat-box"><div class="num ac" id="s-cached">—</div><div class="lbl">快取命中</div></div>
+    <div class="stat-box"><div class="num am" id="s-scanning">—</div><div class="lbl">掃描中</div></div>
+    <div class="stat-box"><div class="num pl" id="s-mappings">—</div><div class="lbl">總映射數</div></div>
+    <div class="stat-box"><div class="num rd" id="s-errors">—</div><div class="lbl">錯誤</div></div>
+    <div class="stat-box"><div class="num" id="s-pending">—</div><div class="lbl">待掃描</div></div>
   </div>
 
-  <div class="phase idle" id="phase">
-    <span class="spinner"></span>
-    <span id="phase-text">等待掃描…</span>
+  <!-- Filter bar -->
+  <div class="filter-bar">
+    <span style="font-size:0.72rem;color:var(--t2)">篩選：</span>
+    <button class="filter-btn active" data-status="" onclick="setFilter('')">全部<span class="cnt" id="cnt-all">0</span></button>
+    <button class="filter-btn" data-status="done" onclick="setFilter('done')">✅ 已完成<span class="cnt" id="cnt-done">0</span></button>
+    <button class="filter-btn" data-status="scanning" onclick="setFilter('scanning')">🔄 掃描中<span class="cnt" id="cnt-scanning">0</span></button>
+    <button class="filter-btn" data-status="pending" onclick="setFilter('pending')">⏳ 待掃描<span class="cnt" id="cnt-pending">0</span></button>
+    <button class="filter-btn" data-status="error" onclick="setFilter('error')">❌ 錯誤<span class="cnt" id="cnt-error">0</span></button>
+    <span style="margin-left:auto;font-size:0.68rem;color:var(--t3)">點擊檔名可直接打開檔案</span>
   </div>
 
-  <div id="time-info" style="text-align:center;font-size:0.7rem;color:var(--t3)"></div>
+  <!-- File list -->
+  <div class="file-list" id="file-list">
+    <div class="empty">按「開始掃描」啟動，或等待自動重建</div>
+  </div>
 
-  <div class="back-link"><a href="/">← 返回儀表板</a></div>
+  <!-- Pagination -->
+  <div class="pagination" id="pagination"></div>
+
+  <!-- Suggestions -->
+  <div class="suggestions">
+    <h3>💡 功能建議 / 已知限制</h3>
+    <ul>
+      <li>建議加入「增量掃描」模式 — 只掃描有新/修改檔案嘅 folder</li>
+      <li>大型 DWG (>500MB) 處理較慢，建議預先壓縮或拆分</li>
+      <li>可加入「掃描排程」— 每日自動重建（目前 12:00 PM 已設定）</li>
+      <li>網絡磁碟機路徑 (Z:) 會自動 fallback 到本機暫存，速度較慢</li>
+      <li>可考慮加 TG→加工圖「反向查詢」功能到此頁面</li>
+      <li>建議加入「下載全部已完成映射」為 CSV</li>
+      <li>大型 DWG 產生嘅 JSON > 500MB 會觸發 scanHugeJson 模式</li>
+    </ul>
+  </div>
 </div>
 
 <script>
-function fmt(s) { return Math.floor(s / 60) + "m " + (s % 60) + "s"; }
+var curFilter = '';
+var curPage = 1;
+var pageSize = 50;
+var fileDetails = {};
+var lastProgress = null;
+
+function fmtSize(b) {
+    if (!b || b <= 0) return '';
+    if (b < 1024) return b + 'B';
+    if (b < 1048576) return (b/1024).toFixed(1) + 'KB';
+    return (b/1048576).toFixed(1) + 'MB';
+}
+function fmtDur(ms) {
+    if (!ms || ms <= 0) return '';
+    var s = Math.floor(ms/1000);
+    var m = Math.floor(s/60);
+    var h = Math.floor(m/60);
+    if (h) return h+'h '+(m%60)+'m';
+    if (m) return m+'m '+(s%60)+'s';
+    return s+'s';
+}
 
 async function poll() {
     try {
         var r = await fetch("/api/deepscan/progress");
         var d = await r.json();
+        lastProgress = d;
+        fileDetails = d.fileDetails || {};
 
+        // Progress
         document.getElementById("pct").textContent = d.percent + "%";
-        document.getElementById("count").textContent = d.current + " / " + d.total;
+        document.getElementById("count-info").textContent = d.current + " / " + d.total;
         document.getElementById("bar").style.width = d.percent + "%";
         document.getElementById("filename").textContent = d.currentFile || "—";
-        document.getElementById("s-scanned").textContent = d.scannedCount;
-        document.getElementById("s-cached").textContent = d.cachedCount;
+        document.getElementById("phase-text").textContent = d.phase || (d.running ? "掃描中…" : (d.paused ? "已暫停" : "待機中…"));
+        document.getElementById("elapsed").textContent = fmtDur(d.elapsedMs);
+
+        var spinner = document.getElementById("spinner");
+        spinner.style.display = (d.running && !d.paused) ? 'inline-block' : 'none';
+
+        // Stats
+        var sc = d.statusCounts || {};
+        document.getElementById("s-total").textContent = d.total;
+        document.getElementById("s-dwg").textContent = d.dwgCount;
+        document.getElementById("s-done").textContent = sc.done || 0;
+        document.getElementById("s-cached").textContent = sc.cached || 0;
+        document.getElementById("s-scanning").textContent = sc.scanning || 0;
         document.getElementById("s-mappings").textContent = d.mappingCount;
-        document.getElementById("s-errors").textContent = d.errorCount;
-        document.getElementById("phase-text").textContent = d.phase || (d.running ? "掃描中…" : "待機");
-        document.getElementById("time-info").textContent = "已用 " + d.elapsedText;
+        document.getElementById("s-errors").textContent = sc.error || 0;
+        document.getElementById("s-pending").textContent = sc.pending || 0;
 
-        var phase = document.getElementById("phase");
-        phase.className = "phase";
-        if (!d.running) phase.classList.add("done");
+        // Filter counts
+        document.getElementById("cnt-all").textContent = d.total;
+        document.getElementById("cnt-done").textContent = (sc.done||0)+(sc.cached||0);
+        document.getElementById("cnt-scanning").textContent = sc.scanning||0;
+        document.getElementById("cnt-pending").textContent = sc.pending||0;
+        document.getElementById("cnt-error").textContent = sc.error||0;
 
-    } catch(e) {}
-    setTimeout(poll, 1000);
+        // Buttons
+        document.getElementById("btn-start").disabled = d.running;
+        document.getElementById("btn-pause").disabled = !d.running || d.paused;
+        document.getElementById("btn-resume").disabled = !d.paused;
+        document.getElementById("checkpoint-info").textContent = d.paused ? ('暫停於: ' + (d.lastCheckpoint||'').split(/[\\\\\\/]/).pop()) : '';
+
+        // Render file list
+        renderFileList();
+
+    } catch(e) { console.error(e); }
+    setTimeout(poll, d && d.running && !d.paused ? 500 : 2000);
 }
+
+function setFilter(status) {
+    curFilter = status;
+    curPage = 1;
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.status === status));
+    renderFileList();
+}
+
+function renderFileList() {
+    var order = lastProgress ? (lastProgress.fileOrder || []) : [];
+    var filtered = [];
+    for (var i = 0; i < order.length; i++) {
+        var fp = order[i];
+        var fd = fileDetails[fp] || {name: fp.split(/[\\\\\\/]/).pop(), status:'pending', numbers:[], error:'', size:0};
+        if (!curFilter || fd.status === curFilter || (curFilter === 'done' && fd.status === 'cached')) {
+            filtered.push({path: fp, idx: i+1, name: fd.name, status: fd.status, numbers: fd.numbers||[], error: fd.error||'', size: fd.size});
+        }
+    }
+
+    var total = filtered.length;
+    var totalPages = Math.max(1, Math.ceil(total / pageSize));
+    if (curPage > totalPages) curPage = totalPages;
+    var start = (curPage - 1) * pageSize;
+    var pageItems = filtered.slice(start, start + pageSize);
+
+    var html = '';
+    if (pageItems.length === 0) {
+        html = '<div class="empty">暫無檔案</div>';
+    } else {
+        for (var j = 0; j < pageItems.length; j++) {
+            var it = pageItems[j];
+            var dotClass = it.status === 'done' ? 'done' : it.status === 'cached' ? 'cached' : it.status === 'scanning' ? 'scanning' : it.status === 'error' ? 'error' : it.status === 'skipped' ? 'skipped' : 'pending';
+            var numStr = (it.numbers||[]).slice(0, 3).join(', ');
+            if ((it.numbers||[]).length > 3) numStr += ' …+' + it.numbers.length;
+            var errStr = it.error ? ('<span class="err">' + h(it.error.substring(0, 80)) + '</span>') : '';
+            html += '<div class="file-item">' +
+                '<span class="idx">' + it.idx + '</span>' +
+                '<span class="st-dot ' + dotClass + '"></span>' +
+                '<a class="name" href="/api/deepscan/download?path=' + encodeURIComponent(it.path) + '" target="_blank" title="' + h(it.path) + '">' + h(it.name) + '</a>' +
+                (numStr ? '<span class="nums" title="匹配加工圖號">📋 ' + h(numStr) + '</span>' : '') +
+                '<span class="size">' + fmtSize(it.size) + '</span>' +
+                errStr +
+                '</div>';
+        }
+    }
+
+    document.getElementById("file-list").innerHTML = html;
+
+    // Pagination
+    var pag = '';
+    if (totalPages > 1) {
+        pag += '<button class="page-btn" ' + (curPage<=1?'disabled':'') + ' onclick="goPage('+(curPage-1)+')">←</button>';
+        for (var p = Math.max(1, curPage-2); p <= Math.min(totalPages, curPage+2); p++) {
+            pag += '<button class="page-btn'+(p===curPage?' active':'')+'" onclick="goPage('+p+')">'+p+'</button>';
+        }
+        pag += '<button class="page-btn" ' + (curPage>=totalPages?'disabled':'') + ' onclick="goPage('+(curPage+1)+')">→</button>';
+        pag += '<span style="font-size:0.7rem;color:var(--t3);margin-left:8px">共 '+total+' 個</span>';
+    }
+    document.getElementById("pagination").innerHTML = pag;
+}
+
+function goPage(p) { curPage = p; renderFileList(); }
+
+function h(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+async function startScan() {
+    try {
+        var r = await fetch("/api/deepscan/start", {method:'POST'});
+        var d = await r.json();
+        if (r.status === 409) { alert('已有掃描正在執行'); return; }
+        if (r.ok) { console.log('掃描已啟動'); } else { alert('啟動失敗: ' + (d.error||'unknown')); }
+    } catch(e) { alert('啟動失敗: ' + e.message); }
+}
+
+async function pauseScan() {
+    try {
+        await fetch("/api/deepscan/pause", {method:'POST'});
+    } catch(e) {}
+}
+
+async function resumeScan() {
+    try {
+        await fetch("/api/deepscan/resume", {method:'POST'});
+    } catch(e) {}
+}
+
 poll();
 </script>
 </body>
