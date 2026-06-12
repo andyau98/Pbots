@@ -2,78 +2,43 @@
 
 此目錄包含 PBOTS 機器人的封裝和部署相關文件。
 
-## 📁 部署文件
+## 📁 部署方式
 
-### Docker 配置
+### Windows 一鍵重啟
 
-- **Dockerfile**: 容器化部署配置
-- **docker-compose.yml**: 多容器編排配置
-- **.dockerignore**: Docker 忽略文件列表
-
-### 部署腳本
-
-- **deploy.sh**: Linux 部署腳本
-- **deploy.ps1**: Windows 部署腳本
-- **install.sh**: 安裝腳本
-
-### 環境配置
-
-- **.env.example**: 環境變數示例
-- **production.env**: 生產環境配置
-- **development.env**: 開發環境配置
-
-## 🚀 部署方式
-
-### Docker 部署
-
-```bash
-# 構建鏡像
-docker build -t pbots .
-
-# 運行容器
-docker run -d --name pbots pbots
+專案根目錄的 `PBOTS.bat`：
+```batch
+taskkill /F /IM node.exe
+taskkill /F /IM chrome.exe
+del /f .wwebjs_auth\session-pbots-client\SingletonLock
+del /f .wwebjs_auth\session-pbots-client\Default\SingletonLock
+npm start
 ```
 
-### 傳統部署
+### 手動部署
 
 ```bash
 # 安裝依賴
 npm install
 
+# 設定環境變數
+cp .env.example .env
+# 編輯 .env → AUTH_PASSWORD=你的密碼
+
 # 啟動服務
 npm start
+# 監控儀表板：http://localhost:3456
 ```
 
-## 🔧 部署配置
+## 🔧 環境變數
 
-### 環境變數
+| 變數 | 說明 |
+|------|------|
+| `AUTH_PASSWORD` | 管理員認證密碼 |
 
-```bash
-# WhatsApp 配置
-WHATSAPP_SESSION_PATH=/app/sessions
-WHATSAPP_HEADLESS=true
+## 📊 監控端點
 
-# 應用配置
-PBOTS_CONFIG_PATH=/app/configs
-PBOTS_LOG_LEVEL=info
-```
-
-### 端口配置
-
-- **應用端口**: 3000 (可配置)
-- **監控端口**: 8080 (健康檢查)
-
-## 📊 監控和日誌
-
-### 健康檢查
-
-```bash
-# 健康檢查端點
-curl http://localhost:8080/health
-```
-
-### 日誌收集
-
-- 容器日誌輸出到標準輸出
-- 日誌文件自動輪轉
-- 支持日誌聚合服務
+- 儀表板：`http://localhost:3456/`
+- 圖紙搜尋：`http://localhost:3456/drawing`
+- Deep Scan：`http://localhost:3456/deepscan`
+- 狀態 API：`http://localhost:3456/api/status`

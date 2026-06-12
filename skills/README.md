@@ -8,7 +8,8 @@
 
 - **SessionManager** (`src/core/sessionManager.js`)：群組觸發 → 私訊問答 → 群組結果，附群組鎖定防干擾
 - **CommandRouter** (`src/core/commandRouter.js`)：統一命令登記與權限分發
-- **DataStore** (`src/core/dataStore.js`)：所有可變數據的統一持久化入口
+- **DataStore** (`src/core/dataStore.js`)：所有可變數據的統一持久化入口 (JSON)
+- **Database** (`src/core/database.js`)：SQLite 資料庫（圖紙索引、TG 快取、TG 映射）
 - **AuthManager** (`src/core/authManager.js`)：管理員 / 封鎖 / 授權群組權限
 
 ### 技能 Handler 標準介面
@@ -21,6 +22,17 @@
     async onTimeout(ctx) → "超時訊息",
     async onCancel(ctx) → "取消訊息",
 }
+```
+
+**Handler 完整回傳 Schema（支援單一/多附件）：**
+
+```
+回傳值:
+  { done: true, result: "文字結果" }
+  { done: true, result: "文字", attachment: "/path/file" }
+  { done: true, result: "文字", attachments: ["...", "..."],
+    attachmentCaption: "摘要", completionMessage: "✅ 已完成" }
+  { question: "下一條問題？" }
 ```
 
 ### 登記方式
@@ -48,10 +60,23 @@ router.register('命令名', handlerFunction, {
 
 ### 🔍 物料圖紙搜尋 (Drawing Search) ✅ 已實作
 
-- **命令**: `#圖紙 [編號]` / `#searchpor`
-- **功能**: 預建索引搜尋 POR 目錄，支援物料碼分類（FST=鐵料、FAC=鋁板…），凌晨 3:00 AM 自動重建
-- **數據**: `data/store/drawing_index.json`
+- **命令**: `#Drawing` / `#searchpor` / `#dwgfind` / `#找位置圖` / `#findlayout` / `#rebuildTg`
+- **功能**: 
+  - SQLite 預建索引搜尋 POR 目錄（52,000+ 檔案）
+  - 支援物料碼分類（FST=鐵料、FAC=鋁板、BGL=玻璃…共 16 類）
+  - 空格分隔多條件 AND 搜尋（物料碼 + 通用碼 + 關鍵字）
+  - 支援格式選擇（PDF、DWG、兩方一併下載）
+  - TG 位置圖掃描（DWG 直接提取文字，不需 OCR）
+  - `tg_mapping` 雙向索引：加工圖號 → 位置圖的反向查詢
+  - 中午 12:00 PM 自動重建索引 + DeepScan TG 映射
+- **Deep Scan 系統**：
+  - `_rebuildTgMapping()`：遍歷所有 DWG 位置圖，提取繪圖編號寫入 `tg_mapping`
+  - 增量跳過：靠 `folder_cache.tg_file_sizes` 比對，無變更就跳過掃描
+  - File 級快取：靠 `tg_cache.mtime` 檢查，未改動直接讀快取
+  - `_restoreProgressFromDb()`：啟動時從 DB 還原已完成的掃描進度
+- **數據**: SQLite `pbots.db`（files, folder_cache, tg_cache, tg_mapping 表）
 - **檔案**: `skills/drawingSearch.js`
+- **輔助**: `skills/tgParser.js` (DXF/PDF/OCR 三層策略), `tools/dwgReader.js` (libredwg DWG 提取)
 
 ### 📦 物料追蹤 (MaterialTracking)
 
@@ -112,14 +137,15 @@ router.register('命令名', handlerFunction, {
 
 1. 在 `skills/` 目錄下建立 `skillName.js`
 2. 實作 SessionManager handler 介面（start / handleReply / onTimeout / onCancel）
-3. 使用 DataStore 進行數據持久化（`dataStore.get(key)` / `dataStore.set(key, value)`）
+3. 使用 DataStore 或 Database 進行數據持久化
 4. 在 `src/modules/commands.js` 的 `registerAll()` 中登記命令
 5. 如需 PDF 輸出，使用 `dataStore.exportFile(filename, content)` 統一出檔
 
 ### 數據規範
 
-- 所有可變數據透過 `src/core/dataStore.js` 操作
-- 專用數據可建立獨立 JSON 檔案（如 `data/store/snags.json`）
+- 所有可變數據透過 `src/core/dataStore.js`（JSON）或 `src/core/database.js`（SQLite）操作
+- 結構化查詢（WHERE、ORDER BY）應使用 SQLite
+- Key-value 數據應使用 DataStore
 - 報表/備份輸出到 `data/exports/`
 - 媒體檔案存放於 `data/images/`
 

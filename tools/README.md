@@ -2,71 +2,90 @@
 
 此目錄包含 PBOTS 機器人的各種輔助工具和工具類。
 
-## 📋 預期工具列表
+## 📋 已實作工具
 
-### 邏輯引擎 (LogicEngine)
+### common/utils.js — 共用工具函數
 
-- **功能**: 處理 Excel 表格邏輯和問答流程
-- **文件**: `logicEngine.js`
-- **狀態**: 待實現
+- `ensureDir(dirPath)` — 確保目錄存在，不存在則遞迴建立
+- `formatFileSize(bytes)` — 格式化檔案大小為可讀字串（B/KB/MB/GB）
+- `calculateDirSize(dirPath)` — 遞迴計算目錄下所有檔案的總大小
 
-### 安全管理器 (SecurityManager)
+### messageLogger.js — JSONL 訊息日誌
 
-- **功能**: 用戶權限管理和安全檢查
-- **文件**: `securityManager.js`
-- **狀態**: 待實現
+- Append-only 每日訊息日誌
+- 記錄訊息類型（命令、媒體、一般）、發送者、內容
+- `getTodayStats()` 提供今日統計供儀表板使用
+- `readExistingLogs(logFile)` 讀取歷史日誌用於命令排行
 
-### 路徑管理器 (PathManager)
+### mediaDownloader.js — 媒體自動下載
 
-- **功能**: 標準化路徑管理和文件操作
-- **文件**: `pathManager.js`
-- **狀態**: 待實現
+- 自動偵測並下載 WhatsApp 訊息中的圖片、文件
+- 依檔案類型分類儲存到 `data/images/`
 
-### 健康監控器 (HealthMonitor)
+### imageToPdf.js — 照片→PDF
 
-- **功能**: 系統健康狀態監控和報告
-- **文件**: `healthMonitor.js`
-- **狀態**: 待實現
+- 收集多張照片生成 A4 2×2 網格 PDF
+- 使用 pdfkit + simhei.ttf（Windows）/ Arial Unicode.ttf（macOS）
+- 支援自訂標題
 
-## 🎯 工具設計原則
+### dwgReader.js — DWG 文字提取
+
+- 使用 libredwg 的 `dwgread` 工具直接從 AutoCAD DWG 檔案提取文字
+- **不需 OCR，100% 準確**。提取結果包含 MTEXT 和 ATTRIB
+- 依賴外部二進位：`tools/libredwg/dwgread.exe`（Windows）
+- 支援超大 DWG JSON 掃描模式（>500MB 自動 fallback）
+- API：
+  - `extractTextFromDwg(path)` → `[{text, entity}]`
+  - `extractTextArrayFromDwg(path, timeout)` → `string[]`
+  - `isDwgReaderAvailable()` → `boolean`
+- Timeout：預設 120 秒，TG 掃描用 60 秒
+
+### cleanup.js — 舊檔案清理
+
+- 定期清理過期媒體、日誌、暫存檔
+- 支援自訂保留天數
+
+### healthMonitor.js — 系統健康監控
+
+- 監控訊息數量、錯誤數量、系統資源
+- 每 60 秒心跳更新
+- 每 24 小時定時健康報告
+
+### errorRecovery.js — 錯誤恢復
+
+- 指數退避重連：基數 1 秒、上限 30 秒、最多 10 次
+- 錯誤分類：認證、連接、網絡、權限、檔案、媒體、記憶體、未知
+
+### weatherReporter.js — 香港天氣
+
+- 使用 axios 調用香港天文台 API
+- 支援繁體中文回覆
+
+### newsReporter.js + realNewsFetcher.js — 地盤新聞
+
+- Google News RSS + cheerio 解析
+- realNewsFetcher.js 從 RSS 提取真實文章 URL
+- 過濾香港地盤相關新聞
+
+## 🔧 工具使用方式
 
 ### 模組化設計
 
 - 每個工具獨立封裝特定功能
-- 支持依賴注入和配置管理
-- 易於測試和維護
+- 透過 `index.js` 的服務容器注入依賴
+- 支援依賴注入和配置管理
 
 ### 錯誤處理
 
 - 完整的異常處理機制
 - 友好的錯誤訊息
-- 自動恢復能力
+- 自動恢復能力（errorRecovery.js）
 
 ### 日誌記錄
 
-- 詳細的操作日誌
-- 可配置的日誌級別
-- 結構化日誌輸出
-
-## 🔄 集成方式
-
-### 配置載入
-
-```javascript
-const config = require('../configs/settings.json');
-const tool = new Tool(config);
-```
-
-### 錯誤處理
-
-```javascript
-try {
-    await tool.execute();
-} catch (error) {
-    console.error('工具執行失敗:', error);
-    // 錯誤恢復邏輯
-}
-```
+- 所有 `console.log/warn/error` 自動被 LogStream 攔截
+- 推送至監控儀表板 SSE 串流
+- 緩存最近 200 條日誌
 
 ## 📈 開發指南
 
@@ -74,13 +93,13 @@ try {
 
 1. 在 `tools/` 目錄下創建新的 JavaScript 文件
 2. 實現工具類和相關方法
-3. 添加完整的錯誤處理
+3. 在 `src/index.js` 的服務容器中註冊
 4. 編寫測試用例
-5. 更新此 README 文檔
+5. 更新此 README
 
 ### 工具規範
 
 - 使用 ES6+ 語法
-- 支持異步操作 (async/await)
+- 支持 async/await 異步操作
 - 提供清晰的 API 文檔
 - 包含使用示例

@@ -283,22 +283,48 @@ pbots.db
 │   ├── por              # POR 子目錄名
 │   └── materials, has_tag
 ├── folder_cache         # Folder 級預緩存（加快位置圖搜尋速度）
-│   └── drawing_numbers, drawing_files, tg_files, dwg_tg_files, pdf_tg_files
-└── tg_cache             # TG DWG 內容快取（取代 app.json tg_content_cache）
-    └── drawing_numbers, source_method, mtime
+│   └── drawing_numbers, drawing_files, tg_files, dwg_tg_files, pdf_tg_files, tg_file_sizes
+├── tg_cache             # TG DWG 內容快取（取代 app.json tg_content_cache）
+│   └── drawing_numbers, source_method, mtime
+└── tg_mapping           # TG 位置圖 → 加工圖號 雙向映射（預建索引）
+    └── drawing_number, file_path, dwg_path, updated_at
 ```
+
+### Deep Scan 系統
+
+`_rebuildTgMapping()` 係 TG 位置圖嘅預建索引系統，喺 `buildIndex()` 完成後自動執行：
+
+- **目的：** 掃描所有 DWG 位置圖，提取繪圖編號，建立 `tg_mapping` 雙向索引
+- **增量跳過：** 靠 `folder_cache.tg_file_sizes` 比對 folder 內檔案是否有變更，無變更就跳過掃描
+- **File 級快取：** 靠 `tg_cache.mtime` 檢查單一檔案修改時間，未變更直接讀快取
+- **folder_cache 保留：** `buildIndex()` **唔會刪除** `folder_cache` 表，只清理路徑不存在嘅 entries
+- **進度追蹤：** 透過 `_deepscanProgress` 全域物件，供 `/api/deepscan/progress` 同 `/deepscan` UI 查詢
+- **啟動時還原進度：** `_restoreProgressFromDb()` 從 `tg_mapping` + `tg_cache` 載入已完成嘅掃描記錄
+- **tg_cache 清理：** 掃描完成後清理已唔存在檔案嘅快取，保留仍在嘅檔案快取（含已跳過 folder）
 
 **注意：** `dataStore` (JSON) 同 `database` (SQLite) 係並存嘅兩個儲存系統。JSON 仍然負責：管理員、封鎖、群組、判頭等數據。SQLite 只負責圖紙索引相關。新功能若需要結構化查詢（WHERE、ORDER BY）應考慮 SQLite；若只係 key-value 應優先使用 DataStore。
 
 ### 監控儀表板 API
 
-MonitorServer（`src/core/monitorServer.js`）提供三個 HTTP endpoint：
+MonitorServer（`src/core/monitorServer.js`）提供以下 HTTP endpoint：
 
 | Endpoint | 說明 |
 |----------|------|
 | `GET /` | HTML 頁面（QR Code 掃碼頁 或 儀表板，自動切換） |
 | `GET /api/status` | JSON 狀態 API（訊息統計、安全、健康、系統資源、活躍會話） |
 | `GET /api/logs/stream` | SSE 即時日誌串流（歷史 50 條 + 即時推送） |
+| `GET /drawing` | 圖紙搜尋 Web UI（瀏覽器搜尋 + 下載） |
+| `GET /api/drawing/search` | 圖紙搜尋 API（`?q=關鍵字&system=系統碼&page=頁數`） |
+| `GET /api/drawing/systems` | 系統碼列表 API |
+| `GET /api/drawing/send` | 圖紙發送 API（`?path=檔案路徑`） |
+| `GET /api/drawing/download` | 圖紙下載 API（`?path=檔案路徑`，直接串流） |
+| `GET /deepscan` | TG 位置圖 Deep Scan 進度頁面（即時進度 + 檔案列表） |
+| `GET /api/deepscan/progress` | DeepScan 進度 JSON API（含 statusCounts、fileDetails） |
+| `GET /api/deepscan/files` | DeepScan 檔案列表 API（`?status=done&page=1&pageSize=50`） |
+| `GET /api/deepscan/download` | DeepScan 檔案下載（`?path=檔案路徑`） |
+| `POST /api/deepscan/start` | 手動觸發 DeepScan |
+| `POST /api/deepscan/pause` | 暫停 DeepScan |
+| `POST /api/deepscan/resume` | 繼續 DeepScan |
 
 儀表板前端功能：日誌級別過濾（Info/Warn/Error）、關鍵字搜尋、暫停自動捲動、清除緩存（最多保留 300 行）。
 
@@ -449,6 +475,7 @@ input ──→ [結果>20?] ──→ filter_material ──→ [系統碼>1?] 
 | `!addgroup`                                                                                  | 管理 | 管理 | 授權群組                                         |
 | `!removegroup [ID]`                                                                          | 管理 | 管理 | 移除授權                                         |
 | `!cleanupwhitelist`                                                                          | 管理 | 管理 | 重置所有白名單數據                               |
-| `#圖紙 [編號]`                                                                               | 圖紙 | 管理 | 搜尋圖紙 (POR)                                   |
-| `#searchpor`                                                                                 | 圖紙 | 管理 | 手動重建圖紙索引                                 |
-| `#dwgfind` / `#找位置圖` / `#findlayout`                                                    | 圖紙 | 管理 | 輸入加工圖號 → 反向查詢對應 TG 位置圖             |
+| `#Drawing`                                                                                   | 圖紙 | 管理 | 搜尋圖紙 (POR) — 互動式多步驟                    |
+| `#searchpor`                                                                                 | 圖紙 | 管理 | 手動重建圖紙索引（含 DeepScan TG 映射）          |
+| `#dwgfind` / `#找位置圖` / `#findlayout`                                                    | 圖紙 | 管理 | 輸入加工圖號 → 反向查詢對應 TG 位置圖            |
+| `#rebuildTg`                                                                                 | 圖紙 | 管理 | 手動重建 TG 位置圖映射（只掃描有變更嘅 folder）  |
