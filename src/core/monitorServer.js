@@ -59,6 +59,12 @@ class MonitorServer {
                 case '/api/deepscan/start':
                     this._serveDeepscanStart(res);
                     break;
+                case '/api/deepscan/hugescan':
+                    this._serveHugescan(res);
+                    break;
+                case '/api/deepscan/rescan':
+                    this._serveRescan(url, res);
+                    break;
                 case '/drawing':
                     this._serveDrawingPage(res);
                     break;
@@ -266,11 +272,17 @@ class MonitorServer {
         const pct = p.percent || (p.total > 0 ? Math.min(100, Math.round((p.current || 0) / p.total * 100)) : 0);
 
         // 統計 by status（計埋 skipped folder 嘅 cached/done 檔案）
-        let doneCount = 0, pendingCount = 0, errorCount = 0, cachedCount = 0, scanningCount = 0, skippedCount = 0;
+        // ⚠️ 以 fileOrder 為基準遍歷，確保統計同 total 一致
+        let doneCount = 0, pendingCount = 0, errorCount = 0, cachedCount = 0, scanningCount = 0, skippedCount = 0, emptyCount = 0;
         const errorFiles = [];
-        for (const [fp, fd] of Object.entries(p.fileDetails || {})) {
+        const fileOrder = p.fileOrder || [];
+        const fileDetails = p.fileDetails || {};
+        for (const fp of fileOrder) {
+            const fd = fileDetails[fp];
+            if (!fd) { pendingCount++; continue; }
             switch (fd.status) {
                 case 'done': doneCount++; break;
+                case 'done_empty': emptyCount++; break;
                 case 'cached': cachedCount++; break;
                 case 'scanning': scanningCount++; break;
                 case 'error': errorCount++; errorFiles.push({ path: fp, name: fd.name, error: fd.error?.substring(0, 200) }); break;
@@ -279,8 +291,8 @@ class MonitorServer {
             }
         }
 
-        // completedCount = 已完成 + 快取命中 + 跳過嘅
-        const completedCount = doneCount + cachedCount + skippedCount;
+        // completedCount = 已完成 + 快取命中 + 跳過嘅 + 空內容
+        const completedCount = doneCount + cachedCount + skippedCount + emptyCount;
         const displayCurrent = p.running ? (p.current || 0) : completedCount;
         const displayPct = p.running ? pct : (p.total > 0 ? Math.min(100, Math.round(completedCount / p.total * 100)) : 0);
 
@@ -397,6 +409,47 @@ class MonitorServer {
 
         res.writeHead(202);
         res.end(JSON.stringify({ message: '掃描已啟動', por: porPath }));
+    }
+
+    _serveHugescan(res) {
+        if (drawingSearch.deepscanProgress.running) {
+            res.writeHead(409);
+            return res.end(JSON.stringify({ error: '已有掃描正在執行' }));
+        }
+
+        // 異步啟動 Huge Scan（只掃描 pending 檔案）
+        drawingSearch.scanPendingFiles().catch(err => {
+            console.error('Huge Scan 錯誤:', err);
+        });
+
+        res.writeHead(202);
+        res.end(JSON.stringify({ message: 'Huge Scan 已啟動（只掃描 pending 檔案）' }));
+    }
+
+    _serveRescan(url, res) {
+        const filePath = url.searchParams.get('path');
+        if (!filePath) {
+            res.writeHead(400);
+            return res.end(JSON.stringify({ error: '需要 path 參數' }));
+        }
+
+        // 重新掃描單一檔案：call rebuildTgMapping 會自然幫佢 scan（如果 folder 有變更）
+        // 直接 trigger 一個 mini scan
+        const dp = drawingSearch.deepscanProgress;
+        const fd = dp.fileDetails?.[filePath];
+        if (fd) {
+            fd.status = 'pending';
+            fd.numbers = [];
+            fd.error = '';
+        }
+
+        // Trigger pending scan
+        drawingSearch.scanPendingFiles().catch(err => {
+            console.error('Rescan 錯誤:', err);
+        });
+
+        res.writeHead(202);
+        res.end(JSON.stringify({ message: '重新掃描已啟動', file: filePath }));
     }
 
     // ========== 圖紙搜尋 API ==========
@@ -1281,6 +1334,7 @@ h1{font-size:1.2rem;color:var(--ac);margin-bottom:8px}
   <!-- Control bar -->
   <div class="controls">
     <button class="btn btn-go" id="btn-start" onclick="startScan()">▶ 開始掃描</button>
+    <button class="btn btn-go" id="btn-huge" onclick="startHugeScan()" style="background:var(--pl)">⚡ Huge Scan</button>
     <button class="btn btn-pause" id="btn-pause" onclick="pauseScan()" disabled>⏸ 暫停</button>
     <button class="btn btn-resume" id="btn-resume" onclick="resumeScan()" disabled>▶ 繼續</button>
     <a class="btn btn-back" href="/">← 返回儀表板</a> <a class="btn btn-back" href="/drawing" style="margin-left:4px">🔍 圖紙搜尋</a>
@@ -1507,6 +1561,15 @@ async function resumeScan() {
     try {
         await fetch("/api/deepscan/resume", {method:'POST'});
     } catch(e) {}
+}
+
+async function startHugeScan() {
+    try {
+        var r = await fetch("/api/deepscan/hugescan", {method:'POST'});
+        var d = await r.json();
+        if (r.status === 409) { alert('已有掃描正在執行，請等佢完成先'); return; }
+        if (r.ok) { console.log('Huge Scan 已啟動（只掃描 pending 檔案）'); } else { alert('啟動失敗: ' + (d.error||'unknown')); }
+    } catch(e) { alert('啟動失敗: ' + e.message); }
 }
 
 poll();

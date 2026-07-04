@@ -14,9 +14,9 @@ const { getDatabase } = require('../src/core/database');
 function getDb() { return getDatabase(); }
 
 // 繪圖編號正則：2-4 大寫字母 + 可選分隔符 + 可選字母前綴 + 3-6 位數字
-const DRAWING_NUMBER_RE = /[A-Z]{2,4}[-_]?(?:[A-Z])?\d{3,6}/g; // eslint-disable-line no-unused-vars
+const DRAWING_NUMBER_RE = /[A-Z]{2,4}[-_]?(?:[A-Z])?\d{3,6}/g;
 
-// TG 排除詞（用於從檔名提取系統碼時排除）
+// TG 排除詞（用於 extractDrawingNumbers 過濾，避免位置圖編號被當成繪圖編號）
 const TG_EXCLUDE = new Set([
     'TG', 'TAG', 'RF', 'FOR', 'AND', 'THE', 'NEW', 'OLD',
     'POR', 'ISO', 'DWG', 'PDF', 'DXF', 'JPG', 'PNG', 'TIFF', 'TIF',
@@ -330,13 +330,17 @@ function findMatchingFile(filePath, targetExt) {
 
 // ========== TG 位置圖內容掃描 ==========
 
-/** 從文字中提取所有繪圖編號 */
+/** 從文字中提取所有繪圖編號（自動過濾 TG 位置圖編號） */
 function extractDrawingNumbers(text) {
     const matches = new Set();
     let m;
     DRAWING_NUMBER_RE.lastIndex = 0;
     while ((m = DRAWING_NUMBER_RE.exec(text)) !== null) {
-        matches.add(m[0].replace(/[-_]/g, '').toUpperCase());
+        const num = m[0].replace(/[-_]/g, '').toUpperCase();
+        // 過濾排除詞：避免位置圖編號（如 TG1234）被當成繪圖編號
+        const code = num.match(/^([A-Z]{2,4})/)?.[1] || '';
+        if (TG_EXCLUDE.has(code)) continue;
+        matches.add(num);
     }
     return [...matches];
 }
@@ -435,8 +439,8 @@ async function scanTgFilesForDrawing(tgFilePaths, targetNumbers = []) {
                 continue;
             }
             try {
-                // TG 掃描用 60s timeout，避免卡死
-                const texts = await extractTextArrayFromDwg(tgPath, 60000);
+                // TG 掃描用 120s timeout（大型 DWG 需要更長時間）
+                const texts = await extractTextArrayFromDwg(tgPath, 120000);
                 const allText = texts.join(' ');
                 const dwgNumbers = extractDrawingNumbers(allText.toUpperCase());
 
@@ -560,18 +564,20 @@ function _restoreProgressFromDb() {
         let status = 'pending';
         let numbers = [];
 
+        // Check tg_cache for mtime (fast path) — 無論有冇 tg_mapping 都要檢查
+        const cached = db.getTgCache(tg.path);
+        let tgCacheFresh = false;
+        if (cached && cached.mtime) {
+            try {
+                const stats = fs.statSync(tg.path);
+                if (Math.abs(Number(cached.mtime) - stats.mtimeMs) < 1) {
+                    tgCacheFresh = true;
+                }
+            } catch {}
+        }
+
         if (hasMapping) {
-            // Check tg_cache for mtime (fast path)
-            const cached = db.getTgCache(tg.path);
-            let isCacheFresh = false;
-            if (cached && cached.drawing_numbers && cached.drawing_numbers !== '[]') {
-                try {
-                    const stats = fs.statSync(tg.path);
-                    if (Math.abs(Number(cached.mtime) - stats.mtimeMs) < 1) {
-                        isCacheFresh = true;
-                    }
-                } catch {}
-            }
+            let isCacheFresh = tgCacheFresh && cached.drawing_numbers && cached.drawing_numbers !== '[]';
 
             if (isCacheFresh) {
                 status = 'cached';
@@ -582,6 +588,18 @@ function _restoreProgressFromDb() {
             numbers = nums;
             completedCount++;
             totalNumbers += nums.length;
+        } else if (tgCacheFresh) {
+            // tg_cache 已存在且 mtime 吻合，但 tg_mapping 冇記錄
+            // → 呢個 TG 檔案確實冇繪圖編號，或之前 scan 結果為空
+            // → 標記為 cached/done_empty，避免 Huge Scan 重複掃描
+            if (cached.drawing_numbers && cached.drawing_numbers !== '[]') {
+                try {
+                    numbers = JSON.parse(cached.drawing_numbers);
+                } catch { /* JSON 損壞，保持空 */ }
+            }
+            status = numbers.length > 0 ? 'cached' : 'done_empty';
+            completedCount++;
+            if (numbers.length > 0) totalNumbers += numbers.length;
         }
 
         _deepscanProgress.fileDetails[tg.path] = {
@@ -671,7 +689,23 @@ async function _rebuildTgMapping(porPath) {
             const curStr = JSON.stringify(Object.entries(info.sizes).sort());
             const oldStr = JSON.stringify(Object.entries(storedSizes).sort());
             if (curStr === oldStr) {
-                skippedFolders.push(folder);
+                // ✅ tg_file_sizes 匹配，但必須確認所有檔案都已有 tg_cache
+                // 防止 _buildFolderCache 寫咗 sizes 但冇掃描內容造成嘅死鎖
+                let allCached = true;
+                let missingCacheCount = 0;
+                for (const f of info.files) {
+                    const tgCache = db.getTgCache(f.path);
+                    if (!tgCache) {
+                        allCached = false;
+                        missingCacheCount++;
+                    }
+                }
+                if (allCached) {
+                    skippedFolders.push(folder);
+                } else {
+                    console.log(`  🔍 folder 檔案大小無變更但有 ${missingCacheCount} 個檔案未掃描，加入掃描隊列`);
+                    foldersToScan.push({ folder, files: info.files, sizes: info.sizes });
+                }
             } else {
                 foldersToScan.push({ folder, files: info.files, sizes: info.sizes });
             }
@@ -708,20 +742,29 @@ async function _rebuildTgMapping(porPath) {
     console.log(`  🔄 ${foldersToScan.length} 個 folder 需要重新掃描`);
 
     // 初始化進度追蹤
+    // ⚠️ current 初始值 = 已跳過 folder 嘅檔案數（含 cached），確保百分比從正確位置開始
+    const preSkippedCount = dwgFiles.filter(f => skippedFolders.includes(f.folder || path.dirname(f.path))).length;
+
     _deepscanProgress.running = true;
     _deepscanProgress.paused = false;
     _deepscanProgress.total = dwgFiles.length;
-    _deepscanProgress.current = 0;
+    _deepscanProgress.current = preSkippedCount;
     _deepscanProgress.currentFile = '';
-    _deepscanProgress.scannedCount = 0;
+    _deepscanProgress.scannedCount = preSkippedCount;
     _deepscanProgress.cachedCount = 0;
     _deepscanProgress.errorCount = 0;
     _deepscanProgress.mappingCount = 0;
     _deepscanProgress.dwgCount = dwgFiles.length;
     _deepscanProgress.phase = '掃描 DWG...';
     _deepscanProgress.startTime = new Date().toISOString();
-    _deepscanProgress.percent = 0;
+    _deepscanProgress.percent = dwgFiles.length > 0
+        ? Math.min(100, Math.round(preSkippedCount / dwgFiles.length * 100))
+        : 0;
     _deepscanProgress.lastCheckpoint = '';
+
+    if (preSkippedCount > 0) {
+        console.log(`  📊 已跳過 ${preSkippedCount} 個檔案 (從 ${preSkippedCount}/${dwgFiles.length} 開始, ${_deepscanProgress.percent}%)`);
+    }
 
     // 建立所有 TG file 嘅初始狀態（含已跳過 folder 嘅檔案）
     _deepscanProgress.fileDetails = {};
@@ -794,11 +837,19 @@ async function _rebuildTgMapping(porPath) {
 
                     let numbers = [];
                     if (isFresh) {
-                        numbers = JSON.parse(cached.drawing_numbers);
+                        try {
+                            numbers = JSON.parse(cached.drawing_numbers);
+                        } catch (parseErr) {
+                            // tg_cache JSON 損壞 → 標記為非新鮮，強制重新掃描
+                            console.warn(`  ⚠️ tg_cache JSON 損壞 (${f.name})，重新掃描`);
+                            isFresh = false;
+                        }
+                    }
+                    if (isFresh) {
                         cachedCount++;
                         if (fd) { fd.status = 'cached'; fd.numbers = numbers; }
                     } else {
-                        const texts = await extractTextArrayFromDwg(f.path, 60000);
+                        const texts = await extractTextArrayFromDwg(f.path, 180000);
                         const allText = texts.join(' ');
                         numbers = extractDrawingNumbers(allText.toUpperCase());
 
@@ -854,6 +905,16 @@ async function _rebuildTgMapping(porPath) {
                     _deepscanProgress.errorCount = errorCount;
                     const fd2 = _deepscanProgress.fileDetails[f.path];
                     if (fd2) { fd2.status = 'error'; fd2.error = err.message; }
+
+                    // ⚠️ ERROR 0x1000 或其他執行期錯誤 — 寫 tg_cache 防止重掃
+                    // 唔寫 "[]" — 用 nowMs 令下次 mtime check 失敗，確保 rebuild 會重試
+                    try {
+                        db.setTgCache(f.path, {
+                            drawing_numbers: '[]',
+                            source_method: 'error_fallback',
+                            mtime: Date.now(),
+                        });
+                    } catch { /* 非必要 */ }
                 }
 
                 // Pause check
@@ -919,6 +980,213 @@ async function _rebuildTgMapping(porPath) {
     // 掃描完成後重新從 DB 載入進度（確保 UI 顯示最新狀態）
     setTimeout(() => _restoreProgressFromDb(), 1000);
     return { dwgCount: dwgFiles.length, totalMappings: batchAccum, scannedCount, cachedCount, errorCount, skipped: skippedFolders.length };
+}
+
+// ========== Huge Scan：強制掃描全部 pending 檔案 ==========
+
+/**
+ * Huge Scan：只掃描 status = pending 嘅 TG DWG 檔案（即係冇 tg_cache 又冇 tg_mapping）
+ * 適用於第一次安裝後補掃漏網之魚，唔會重複掃描已完成嘅檔案
+ *
+ * @returns {Promise<{scannedCount: number, errorCount: number, mappingCount: number}>}
+ */
+async function _scanPendingFiles() {
+    const db = getDb();
+
+    // 確保 fileOrder / fileDetails 已從 DB 載入
+    if (!_deepscanProgress.fileOrder || _deepscanProgress.fileOrder.length === 0) {
+        loadIndex();
+    }
+
+    const pendingPaths = _deepscanProgress.fileOrder.filter(fp => {
+        const fd = _deepscanProgress.fileDetails[fp];
+        return fd && (fd.status === 'pending' || fd.status === 'error');
+    });
+
+    // 重置 error status → pending
+    for (const fp of pendingPaths) {
+        const fd = _deepscanProgress.fileDetails[fp];
+        if (fd && fd.status === 'error') { fd.status = 'pending'; fd.error = ''; }
+    }
+
+    if (pendingPaths.length === 0) {
+        console.log('  ✅ 沒有待掃描檔案 (pending = 0)');
+        _deepscanProgress.running = false;
+        _deepscanProgress.phase = '已完成';
+        return { scannedCount: 0, errorCount: 0, mappingCount: 0 };
+    }
+
+    console.log(`⚡ Huge Scan: 掃描 ${pendingPaths.length} 個 pending 檔案...`);
+    if (!isDwgReaderAvailable()) {
+        console.warn('  ⚠️ DWG Reader 不可用，跳過 Huge Scan');
+        return { scannedCount: 0, errorCount: 0, mappingCount: 0 };
+    }
+
+    // 計返目前已完成嘅數量（非 pending）
+    const existingCompleted = _deepscanProgress.fileOrder.length - pendingPaths.length;
+
+    // 初始化進度
+    _deepscanProgress.running = true;
+    _deepscanProgress.paused = false;
+    // total 保持不變，current 從已完成嘅開始
+    _deepscanProgress.total = _deepscanProgress.fileOrder.length;
+    _deepscanProgress.current = existingCompleted;
+    _deepscanProgress.currentFile = '';
+    _deepscanProgress.phase = 'Huge Scan...';
+    _deepscanProgress.startTime = new Date().toISOString();
+    _deepscanProgress.percent = _deepscanProgress.total > 0
+        ? Math.min(100, Math.round(existingCompleted / _deepscanProgress.total * 100))
+        : 0;
+
+    const BATCH_SIZE = 50;
+    const KEEP_PATHS = new Set();
+    let scannedCount = 0;
+    let errorCount = 0;
+    let batchAccum = 0;
+
+    try {
+        for (let i = 0; i < pendingPaths.length; i++) {
+            const fpath = pendingPaths[i];
+            const fd = _deepscanProgress.fileDetails[fpath];
+            if (!fd) continue;
+
+            _deepscanProgress.current++;
+            _deepscanProgress.currentFile = fd.name;
+            _deepscanProgress.percent = _deepscanProgress.total > 0
+                ? Math.min(100, Math.round(_deepscanProgress.current / _deepscanProgress.total * 100)) : 0;
+            _deepscanProgress.lastCheckpoint = fpath;
+
+            // 更新 status → scanning
+            fd.status = 'scanning';
+
+            try {
+                const stat = fs.statSync(fpath);
+                fd.size = stat.size;
+
+                // mtime 快取檢查
+                const cached = db.getTgCache(fpath);
+                let isFresh = cached &&
+                    cached.drawing_numbers &&
+                    cached.drawing_numbers !== '[]' &&
+                    Math.abs(Number(cached.mtime) - stat.mtimeMs) < 1;
+
+                let numbers = [];
+                if (isFresh) {
+                    try {
+                        numbers = JSON.parse(cached.drawing_numbers);
+                    } catch (parseErr) {
+                        // tg_cache JSON 損壞 → 強制重新掃描
+                        console.warn(`  ⚠️ tg_cache JSON 損壞 (${fd.name})，重新掃描`);
+                        isFresh = false;
+                    }
+                }
+                if (isFresh) {
+                    fd.status = 'cached';
+                    fd.numbers = numbers;
+                    _deepscanProgress.cachedCount++;
+                } else {
+                    const texts = await extractTextArrayFromDwg(fpath, 180000);
+                    const allText = texts.join(' ');
+                    numbers = extractDrawingNumbers(allText.toUpperCase());
+
+                    // 寫入 tg_cache
+                    db.setTgCache(fpath, {
+                        drawing_numbers: JSON.stringify(numbers),
+                        source_method: 'dwg_direct',
+                        mtime: stat.mtimeMs,
+                    });
+                    scannedCount++;
+                    _deepscanProgress.scannedCount = scannedCount;
+                    fd.status = 'done';
+                    fd.numbers = numbers;
+                }
+
+                if (numbers.length > 0) {
+                    KEEP_PATHS.add(fpath);
+
+                    // 寫入 tg_mapping
+                    const now = new Date().toISOString();
+                    const batchMappings = [];
+                    for (const num of numbers) {
+                        batchMappings.push({
+                            drawing_number: num,
+                            file_path: fpath,
+                            dwg_path: fpath,
+                            updated_at: now,
+                        });
+                    }
+
+                    // 也為 companion PDF 建立 mapping
+                    const pdfPath = fpath.replace(/\.dwg$/i, '.pdf');
+                    if (fs.existsSync(pdfPath)) {
+                        KEEP_PATHS.add(pdfPath);
+                        for (const num of numbers) {
+                            batchMappings.push({
+                                drawing_number: num,
+                                file_path: pdfPath,
+                                dwg_path: fpath,
+                                updated_at: now,
+                            });
+                        }
+                    }
+
+                    db.insertTgMapping(batchMappings);
+                    batchAccum += batchMappings.length;
+                    _deepscanProgress.mappingCount += batchMappings.length;
+                }
+
+            } catch (err) {
+                errorCount++;
+                _deepscanProgress.errorCount++;
+                if (fd) { fd.status = 'error'; fd.error = err.message; }
+
+                // ⚠️ 即使 scan 失敗都要寫 tg_cache，防止下次 Huge Scan 重掃
+                // 用 Date.now() 而非 stat.mtimeMs，令 rebuild mtime check 失敗 → 自動重試
+                try {
+                    db.setTgCache(fpath, {
+                        drawing_numbers: '[]',
+                        source_method: 'hugescan_error_fallback',
+                        mtime: Date.now(),
+                    });
+                } catch { /* 非必要 */ }
+                console.error(`  ❌ Huge Scan 失敗 (${fd.name}):`, err.message);
+            }
+
+            // Pause check
+            if (_deepscanProgress.paused) {
+                console.log(`  ⏸️ Huge Scan 已暫停 (${_deepscanProgress.current}/${_deepscanProgress.total})`);
+                while (_deepscanProgress.paused) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                console.log(`  ▶️ Huge Scan 已繼續`);
+            }
+
+            // 每 BATCH_SIZE 個檔案清理一次 tg_cache
+            if (_deepscanProgress.current % BATCH_SIZE === 0) {
+                try { db.cleanupTgCache([...KEEP_PATHS]); } catch { /* 非必要 */ }
+                const pct = _deepscanProgress.percent;
+                console.log(`  ... Huge Scan ${_deepscanProgress.current}/${_deepscanProgress.total} (${pct}%, ${batchAccum} mappings)`);
+            }
+        }
+    } catch (outerErr) {
+        console.error('  ❌ Huge Scan 未預期錯誤:', outerErr.message);
+        errorCount++;
+    }
+
+    // 清理
+    try { db.cleanupTgCache([...KEEP_PATHS]); } catch { /* 非必要 */ }
+
+    _deepscanProgress.running = false;
+    _deepscanProgress.phase = '已完成';
+    const stats = db.getTgMappingStats();
+
+    console.log(`  ✅ Huge Scan 完成: ${scannedCount} 個新掃描, ${errorCount} 錯誤`);
+    console.log(`     TG 映射總計: ${stats.total} 條, ${stats.files} 個檔案, ${stats.drawing_numbers} 個圖號`);
+
+    // 重新從 DB 載入（確保 UI 一致）
+    setTimeout(() => _restoreProgressFromDb(), 1000);
+
+    return { scannedCount, errorCount, mappingCount: batchAccum };
 }
 
 // ========== Folder 預緩存（加速位置圖搜尋） ==========
@@ -1979,7 +2247,7 @@ async function incrementalTgUpdate(folderPath) {
             if (isFresh) {
                 numbers = JSON.parse(cached.drawing_numbers);
             } else {
-                const texts = await extractTextArrayFromDwg(fullPath, 60000);
+                const texts = await extractTextArrayFromDwg(fullPath, 120000);
                 const allText = texts.join(' ');
                 numbers = extractDrawingNumbers(allText.toUpperCase());
                 db.setTgCache(fullPath, {
@@ -2106,4 +2374,6 @@ module.exports = {
     checkAndUpdateTgFolder,
     queryTgFromIndex: _queryTgFromIndex,
     deepscanProgress: _deepscanProgress,
+    scanPendingFiles: _scanPendingFiles,
+    restoreProgressFromDb: _restoreProgressFromDb,
 };

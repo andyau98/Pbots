@@ -31,6 +31,12 @@ const ErrorRecovery = require('../tools/errorRecovery');
 const WeatherReporter = require('../tools/weatherReporter');
 const NewsReporter = require('../tools/newsReporter');
 
+// ── 啟動時清理上次 crash 遺留嘅暫存 JSON（防止累積耗盡磁碟）
+try {
+    const { cleanupOrphanedTempFiles } = require('../tools/dwgReader');
+    cleanupOrphanedTempFiles();
+} catch {}
+
 // ── 命令登記 ──
 const { registerAll } = require('./modules/commands');
 
@@ -131,7 +137,8 @@ client.on('qr', async (qr) => {
         // 自動打開瀏覽器顯示 QR Code 頁面
         try {
             const { exec } = require('child_process');
-            exec('open http://localhost:3456');
+            const cmd = process.platform === 'win32' ? 'start' : 'open';
+            exec(`${cmd} http://localhost:3456`);
         } catch {}
 
         console.log(`📱 QR Code 圖片: ${qrPath}`);
